@@ -76,14 +76,7 @@ type AuthConfig struct {
 	Username     string `yaml:"username"`
 	Password     string `yaml:"password"`      // plaintext or "env:VAR"; hashed at load
 	PasswordHash string `yaml:"password_hash"` // pre-computed bcrypt hash
-
-	// enabled is resolved in New: true when the config provides a usable
-	// username + secret combination.
-	enabled bool
 }
-
-// active reports whether declarative basic auth should be enforced.
-func (a AuthConfig) active() bool { return a.enabled }
 
 // expandEnv resolves a "env:VAR" reference to the variable's value, returning
 // the value unchanged otherwise. Empty input yields empty output.

@@ -10,14 +10,14 @@ import (
 
 func TestNormalizePath(t *testing.T) {
 	cases := map[string]string{
-		"/":                 "/",
-		"":                  "/",
-		"/users":            "/users",
-		"/users/123":        "/users/:id",
-		"/users/123/posts":  "/users/:id/posts",
-		"/users/abc":        "/users/abc",
+		"/":                "/",
+		"":                 "/",
+		"/users":           "/users",
+		"/users/123":       "/users/:id",
+		"/users/123/posts": "/users/:id/posts",
+		"/users/abc":       "/users/abc",
 		"/u/550e8400-e29b-41d4-a716-446655440000": "/u/:id",
-		"/order/abc123def456": "/order/:id", // 12+ hex → :id
+		"/order/abc123def456":                     "/order/:id", // 12+ hex → :id
 	}
 	for in, want := range cases {
 		if got := normalizePath(in); got != want {
