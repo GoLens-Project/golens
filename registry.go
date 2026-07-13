@@ -1,0 +1,364 @@
+package golens
+
+import (
+	"context"
+	"log"
+	"regexp"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Registry is the source of truth (Layer 2). It owns the metric store, the
+// non-blocking ingestion queue, the background aggregation loop, optional
+// persistence, and OTLP export.
+//
+// Concurrency: writes from the hot path never touch the map under a lock.
+// Instead they enqueue onto a bounded channel; a single background goroutine
+// drains it and updates the map under a mutex. Reads (snapshots) take a read
+// lock. This keeps request latency predictable.
+type Registry struct {
+	cfg Config
+	ctx context.Context
+
+	mu      sync.RWMutex
+	metrics map[string]*Metric
+	order   []string // insertion order for stable UI listing
+
+	queue chan *sample
+	stop  chan struct{}
+	done  chan struct{}
+
+	storage  Storage
+	exporter *otlpExporter
+	agg      *aggregator
+
+	endpoints *endpointTracker
+
+	auth authState
+
+	include []*regexp.Regexp
+	exclude []*regexp.Regexp
+
+	stopOnce sync.Once
+	started  atomic.Bool
+	debug    bool
+}
+
+type sample struct {
+	name   string
+	value  float64
+	labels []Label
+}
+
+// New constructs a Registry from config. It does not start background work;
+// call Start to begin ingestion/aggregation/export.
+func New(cfg Config) (*Registry, error) {
+	cfg.applyDefaults()
+
+	// Resolve optional admin auth before building the Registry so the wiped
+	// config (no plaintext password) is what gets stored on r.cfg.
+	auth := authState{}
+	if cfg.UI.Enabled {
+		auth = resolveAuth(&cfg.UI.Auth)
+	}
+
+	r := &Registry{
+		cfg:     cfg,
+		metrics: make(map[string]*Metric),
+		queue:   make(chan *sample, cfg.IngestQueueSize),
+		stop:    make(chan struct{}),
+		done:    make(chan struct{}),
+		debug:   cfg.Debug,
+		auth:    auth,
+	}
+
+	// Compile path filters once.
+	for _, p := range cfg.IncludePatterns {
+		if re, err := regexp.Compile(p); err == nil {
+			r.include = append(r.include, re)
+		}
+	}
+	for _, p := range cfg.ExcludePatterns {
+		if re, err := regexp.Compile(p); err == nil {
+			r.exclude = append(r.exclude, re)
+		}
+	}
+
+	// Persistence backend.
+	switch cfg.Storage.Backend {
+	case "sqlite":
+		s, err := newSQLiteStorage(cfg.Storage.Path)
+		if err != nil {
+			return nil, err
+		}
+		r.storage = s
+	default:
+		r.storage = newMemoryStorage(cfg.Storage.TTL)
+	}
+
+	r.agg = newAggregator(r.storage, cfg.FlushInterval)
+
+	r.endpoints = newEndpointTracker(cfg.MaxEndpoints)
+
+	if cfg.OTLP.Enabled {
+		r.exporter = newOTLPExporter(cfg.OTLP)
+	}
+
+	// Pre-register the canonical RED metrics so they always exist.
+	r.mustRegister("http_requests_total", CounterType, "Total HTTP requests", []string{"method", "path", "status"}, nil)
+	r.mustRegister("http_request_errors_total", CounterType, "HTTP errors (status >= 400)", []string{"method", "path"}, nil)
+	r.mustRegister("http_request_duration_seconds", HistogramType, "HTTP request latency", []string{"method", "path"}, DefaultHistogramBounds)
+
+	return r, nil
+}
+
+func (r *Registry) mustRegister(name string, t MetricType, desc string, labels []string, bounds []float64) {
+	m := newMetric(name, t, desc, labels, bounds)
+	r.mu.Lock()
+	r.metrics[name] = m
+	r.order = append(r.order, name)
+	r.mu.Unlock()
+}
+
+// Register declares a custom metric. Safe to call before Start.
+func (r *Registry) Register(name string, t MetricType, desc string, labels []string, bounds []float64) *Metric {
+	r.mu.RLock()
+	if existing, ok := r.metrics[name]; ok {
+		r.mu.RUnlock()
+		return existing
+	}
+	r.mu.RUnlock()
+
+	m := newMetric(name, t, desc, labels, bounds)
+	r.mu.Lock()
+	if len(r.metrics) >= r.cfg.MaxMetrics {
+		// Evict least-recently-used to bound cardinality.
+		r.evictLocked()
+	}
+	r.metrics[name] = m
+	r.order = append(r.order, name)
+	r.mu.Unlock()
+	return m
+}
+
+// evictLocked removes the oldest idle metric. Caller holds the write lock.
+func (r *Registry) evictLocked() {
+	if len(r.order) == 0 {
+		return
+	}
+	now := time.Now().UnixNano()
+	ttl := r.cfg.MetricTTL.Nanoseconds()
+	for _, name := range r.order {
+		m := r.metrics[name]
+		if m == nil {
+			continue
+		}
+		if m.value.last.Load() != 0 && now-m.value.last.Load() > ttl {
+			delete(r.metrics, name)
+			r.removeFromOrder(name)
+			if r.debug {
+				log.Printf("[golens] evicted idle metric %s", name)
+			}
+			return
+		}
+	}
+	// Nothing idle: drop the head.
+	name := r.order[0]
+	delete(r.metrics, name)
+	r.order = r.order[1:]
+}
+
+func (r *Registry) removeFromOrder(name string) {
+	for i, n := range r.order {
+		if n == name {
+			r.order = append(r.order[:i], r.order[i+1:]...)
+			return
+		}
+	}
+}
+
+// Record enqueues a sample. This is the hot path: it never blocks. If the
+// ingestion queue is saturated the sample is dropped (and optionally logged).
+func (r *Registry) Record(name string, value float64, labels ...Label) {
+	select {
+	case r.queue <- &sample{name: name, value: value, labels: labels}:
+	default:
+		if r.debug {
+			log.Printf("[golens] ingestion queue full; dropped sample for %s", name)
+		}
+	}
+}
+
+// Start launches background ingestion + aggregation + export. The provided
+// context is stored on the Registry and governs graceful shutdown: cancelling
+// it triggers a final flush and stops all goroutines. Start is idempotent.
+func (r *Registry) Start(ctx context.Context) error {
+	r.ctx = ctx
+	if r.started.CompareAndSwap(false, true) {
+		go r.loop()
+	}
+	return nil
+}
+
+// loop is the single background goroutine. It drains the ingestion queue,
+// flushes aggregated buckets to storage on a ticker, and pushes OTLP batches.
+func (r *Registry) loop() {
+	defer close(r.done)
+
+	flush := time.NewTicker(r.cfg.FlushInterval)
+	defer flush.Stop()
+
+	var export <-chan time.Time
+	if r.exporter != nil {
+		t := time.NewTicker(r.cfg.OTLP.Interval)
+		export = t.C
+		defer t.Stop()
+	}
+
+	// Resolve the shutdown channel once; the loop body must not re-evaluate
+	// it every iteration (that would allocate a channel per spin).
+	done := r.ctx.Done()
+	if r.ctx == nil {
+		done = nil // never fires; relies on r.stop instead
+	}
+
+	for {
+		select {
+		case <-done:
+			r.finalFlush()
+			return
+		case <-r.stop:
+			r.finalFlush()
+			return
+		case s := <-r.queue:
+			r.process(s)
+		case <-flush.C:
+			r.agg.flushAll(r)
+		case <-export:
+			r.exportBatch()
+		}
+	}
+}
+
+// process applies an ingested sample to the metric store.
+func (r *Registry) process(s *sample) {
+	r.mu.Lock()
+	m, ok := r.metrics[s.name]
+	if !ok {
+		if len(r.metrics) >= r.cfg.MaxMetrics {
+			r.evictLocked()
+		}
+		m = newMetric(s.name, CounterType, "", nil, nil)
+		r.metrics[s.name] = m
+		r.order = append(r.order, s.name)
+	}
+	r.mu.Unlock()
+
+	m.Record(s.value)
+	m.setLabels(s.labels) // last-seen label values for display (lock-free)
+	r.agg.add(s.name, s.value)
+
+	if r.debug {
+		log.Printf("[golens] recorded %s = %f", s.name, s.value)
+	}
+}
+
+// exportBatch collects current snapshots and pushes them via OTLP/HTTP.
+func (r *Registry) exportBatch() {
+	if r.exporter == nil {
+		return
+	}
+	snapshots := r.Snapshots()
+	if len(snapshots) == 0 {
+		return
+	}
+	if err := r.exporter.export(r.ctx, snapshots); err != nil && r.debug {
+		log.Printf("[golens] otlp export failed: %v", err)
+	}
+}
+
+// finalFlush persists aggregated buckets and pushes a final OTLP batch before
+// shutdown. It closes the storage backend exactly once.
+func (r *Registry) finalFlush() {
+	r.agg.flushAll(r)
+	if r.exporter != nil {
+		r.exportBatch()
+	}
+	_ = r.storage.Close()
+}
+
+// Close triggers graceful shutdown and blocks until the loop exits. It is safe
+// to call concurrently and from multiple sites (idempotent). If Start was
+// never called, it performs a one-shot final flush and returns immediately.
+func (r *Registry) Close() error {
+	if !r.started.Load() {
+		// No loop running; do a synchronous final flush and tear down storage.
+		if r.ctx == nil {
+			r.ctx = context.Background()
+		}
+		r.finalFlush()
+		return nil
+	}
+	r.stopOnce.Do(func() { close(r.stop) })
+	select {
+	case <-r.done:
+	case <-time.After(5 * time.Second):
+		// Defensive: never hang the caller if the loop is stuck.
+	}
+	return nil
+}
+
+// shouldTrack reports whether a request path should be instrumented.
+func (r *Registry) shouldTrack(path string) bool {
+	for _, re := range r.exclude {
+		if re.MatchString(path) {
+			return false
+		}
+	}
+	if len(r.include) == 0 {
+		return true
+	}
+	for _, re := range r.include {
+		if re.MatchString(path) {
+			return true
+		}
+	}
+	return false
+}
+
+// SnapshotAll returns current snapshots for the UI/exporter, in registration
+// order.
+func (r *Registry) Snapshots() []MetricSnapshot {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]MetricSnapshot, 0, len(r.order))
+	for _, name := range r.order {
+		if m, ok := r.metrics[name]; ok {
+			out = append(out, m.Snapshot())
+		}
+	}
+	return out
+}
+
+// Snapshot returns a single metric by name.
+func (r *Registry) Snapshot(name string) (MetricSnapshot, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if m, ok := r.metrics[name]; ok {
+		return m.Snapshot(), true
+	}
+	return MetricSnapshot{}, false
+}
+
+// Storage exposes the configured persistence backend for tests/extension.
+func (r *Registry) Storage() Storage { return r.storage }
+
+// EndpointLatency returns per-endpoint latency snapshots (p50/p95/p99) for the
+// dashboard chart.
+func (r *Registry) EndpointLatency() []EndpointLatencySnapshot {
+	if r.endpoints == nil {
+		return nil
+	}
+	return r.endpoints.Snapshots()
+}

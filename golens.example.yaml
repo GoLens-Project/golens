@@ -1,0 +1,53 @@
+# GoLens example configuration.
+#
+# Every field is optional. Unspecified (or zero-value) fields fall back to the
+# defaults shown here, so a partial or empty file is always valid. Drop this
+# file next to your binary as golens.yaml (or load it explicitly with
+# golens.LoadConfig("path/to/golens.yaml")).
+
+# --- Persistence ---
+# "memory" (default): roll-ups kept in RAM, aged out by ttl, ring-bounded by
+#                     max_entries. No external dependencies.
+# "sqlite":           roll-ups persisted to a local SQLite database (pure-Go,
+#                     no CGo). Use for historical analysis on the host.
+storage:
+  backend: memory
+  path: ./golens.db          # used only when backend: sqlite
+  ttl: 24h                   # in-memory roll-ups older than this are evicted
+
+# --- OTLP export (push) ---
+# GoLens pushes metric batches to an OTLP/HTTP receiver (OTel Collector,
+# Grafana Alloy, etc.). gRPC export is deferred to a separate sub-package.
+otlp:
+  enabled: false             # set true to enable push export
+  endpoint: http://localhost:4318/v1/metrics
+  protocol: http             # "http" only for now (gRPC deferred)
+  batch_size: 100            # snapshots per batch
+  interval: 10s              # push cadence (a final push happens on shutdown)
+  timeout: 5s                # per-request timeout
+
+# --- Dashboard ---
+# Embedded HTMX + Alpine.js dashboard mounted at /metrics.
+ui:
+  enabled: true
+  poll_interval: 5s          # HTMX auto-refresh interval
+
+# --- Ingestion & memory ---
+# The hot path enqueues onto a bounded channel and never blocks a request. When
+# the queue is saturated, samples are dropped (logged when debug: true).
+ingest_queue_size: 4096      # max samples buffered before dropping
+max_metrics: 10000           # in-memory series cap; LRU eviction when exceeded
+metric_ttl: 1h               # idle metrics older than this may be evicted
+flush_interval: 30s          # background aggregation/SQLite flush cadence
+
+# --- Path filtering ---
+# include_patterns: empty = track everything. excludes win over includes.
+# Patterns are Go regular expressions (regexp).
+include_patterns: []
+exclude_patterns:
+  - ^/health$
+  - ^/metrics$
+  - ^/favicon\.ico$
+
+# --- Diagnostics ---
+debug: false                 # verbose logging of record/drop/flush/export

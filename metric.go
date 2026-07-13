@@ -1,0 +1,216 @@
+package golens
+
+import (
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// MetricType enumerates the supported metric kinds for the MVP.
+type MetricType int
+
+const (
+	CounterType MetricType = iota
+	GaugeType
+	HistogramType
+)
+
+func (t MetricType) String() string {
+	switch t {
+	case CounterType:
+		return "counter"
+	case GaugeType:
+		return "gauge"
+	case HistogramType:
+		return "histogram"
+	default:
+		return "unknown"
+	}
+}
+
+// ChartType reports the default dashboard chart for a metric kind.
+func (t MetricType) ChartType() string {
+	switch t {
+	case CounterType:
+		return "line"
+	case GaugeType:
+		return "sparkline"
+	case HistogramType:
+		return "bar"
+	default:
+		return "line"
+	}
+}
+
+// Label is a single key/value attribute attached to a metric sample.
+type Label struct {
+	Name  string
+	Value string
+}
+
+// Metric is the user-facing definition of a registered metric. It is the
+// shared, type-erased handle stored in the Registry; the actual sample
+// values live in the thread-safe value underneath.
+type Metric struct {
+	Name        string
+	Type        MetricType
+	Description string
+	Labels      []string
+	value       metricValue
+}
+
+// metricValue is the concurrent-safe numeric payload. Counters and gauges use
+// the atomics directly; histograms keep per-bucket counters. lastLabels holds
+// the most recent label set observed (lock-free) so the UI can show a metric's
+// dimensions without expanding per-label series (cardinality stays bounded).
+type metricValue struct {
+	mu         sync.RWMutex
+	counter    atomic.Int64 // fixed-point (scaled) for counter/gauge
+	gauge      atomic.Int64
+	hist       map[float64]*atomic.Int64 // bucket boundary -> count
+	bounds     []float64
+	sum        atomic.Int64
+	count      atomic.Int64
+	last       atomic.Int64            // unix nano of last update
+	lastLabels atomic.Pointer[[]Label] // last observed label values
+}
+
+const scaleFactor = 1_000_000 // 6 decimal places of precision in fixed-point
+
+// newMetric allocates a metric with the right value structure for its type.
+func newMetric(name string, mtype MetricType, desc string, labels []string, bounds []float64) *Metric {
+	m := &Metric{
+		Name:        name,
+		Type:        mtype,
+		Description: desc,
+		Labels:      labels,
+	}
+	if mtype == HistogramType {
+		if len(bounds) == 0 {
+			bounds = DefaultHistogramBounds
+		}
+		m.value.bounds = bounds
+		m.value.hist = make(map[float64]*atomic.Int64, len(bounds)+1)
+		for _, b := range bounds {
+			v := atomic.Int64{}
+			m.value.hist[b] = &v
+		}
+		v := atomic.Int64{}  // +Inf bucket
+		m.value.hist[0] = &v // key 0 reserved as overflow bucket
+	}
+	return m
+}
+
+// Record adds a sample to the metric. For counters the value is added; for
+// gauges it replaces; for histograms it is bucketed.
+func (m *Metric) Record(v float64) {
+	scaled := int64(v * scaleFactor)
+	now := time.Now().UnixNano()
+	m.value.last.Store(now)
+
+	switch m.Type {
+	case CounterType:
+		m.value.counter.Add(scaled)
+	case GaugeType:
+		m.value.gauge.Store(scaled)
+	case HistogramType:
+		m.value.count.Add(1)
+		m.value.sum.Add(scaled)
+		placed := false
+		for _, b := range m.value.bounds {
+			if v <= b {
+				if c, ok := m.value.hist[b]; ok {
+					c.Add(1)
+					placed = true
+				}
+				break
+			}
+		}
+		if !placed {
+			if c, ok := m.value.hist[0]; ok { // overflow bucket
+				c.Add(1)
+			}
+		}
+	}
+}
+
+// setLabels stores the most recently observed label values (lock-free). It is
+// called from the background loop, not the request path, so the small
+// allocation is acceptable.
+func (m *Metric) setLabels(labels []Label) {
+	if len(labels) == 0 {
+		return
+	}
+	cp := append([]Label(nil), labels...)
+	m.value.lastLabels.Store(&cp)
+}
+
+// Snapshot returns a point-in-time view of the metric's current value(s).
+func (m *Metric) Snapshot() MetricSnapshot {
+	s := MetricSnapshot{
+		Name:        m.Name,
+		Type:        m.Type.String(),
+		Description: m.Description,
+		Labels:      m.Labels,
+		Chart:       m.Type.ChartType(),
+		UpdatedAt:   m.value.last.Load(),
+	}
+	if p := m.value.lastLabels.Load(); p != nil {
+		s.LabelValues = *p
+	}
+	switch m.Type {
+	case CounterType:
+		s.Value = float64(m.value.counter.Load()) / scaleFactor
+	case GaugeType:
+		s.Value = float64(m.value.gauge.Load()) / scaleFactor
+	case HistogramType:
+		s.Count = m.value.count.Load()
+		s.Sum = float64(m.value.sum.Load()) / scaleFactor
+		if s.Count > 0 {
+			s.Avg = s.Sum / float64(s.Count)
+		}
+		s.Buckets = m.histogramBuckets()
+	}
+	return s
+}
+
+func (m *Metric) histogramBuckets() []BucketSnapshot {
+	m.value.mu.RLock()
+	defer m.value.mu.RUnlock()
+	out := make([]BucketSnapshot, 0, len(m.value.bounds)+1)
+	for _, b := range m.value.bounds {
+		if c, ok := m.value.hist[b]; ok {
+			out = append(out, BucketSnapshot{UpperBound: b, Count: c.Load()})
+		}
+	}
+	if c, ok := m.value.hist[0]; ok {
+		out = append(out, BucketSnapshot{UpperBound: 0, Count: c.Load(), Overflow: true})
+	}
+	return out
+}
+
+// MetricSnapshot is a serializable view of a metric, used by the UI and OTLP.
+type MetricSnapshot struct {
+	Name        string
+	Type        string
+	Description string
+	Labels      []string // declared label names
+	LabelValues []Label  // last observed label values (display only)
+	Chart       string
+	Value       float64
+	Count       int64
+	Sum         float64
+	Avg         float64
+	Buckets     []BucketSnapshot
+	UpdatedAt   int64
+}
+
+// BucketSnapshot is one histogram bucket.
+type BucketSnapshot struct {
+	UpperBound float64
+	Count      int64
+	Overflow   bool
+}
+
+// DefaultHistogramBounds used when a histogram is registered without bounds.
+var DefaultHistogramBounds = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}

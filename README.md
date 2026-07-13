@@ -12,41 +12,45 @@ GoLens is designed to be "zero-config" for small services while remaining produc
 
 ### Layer 1: The Collector (Middleware)
 
-The Collector acts as the entry point. It intercepts incoming HTTP/gRPC requests, extracts performance data (RED metrics: Rate, Errors, Duration), and forwards them to the Registry.
+The Collector acts as the entry point. It intercepts incoming HTTP requests, extracts performance data (RED metrics: Rate, Errors, Duration), and forwards them to the Registry.
 
-* **Auto-Instrumentation:** Automatically records standard request metrics without developer intervention.
-* **Custom Hooks:** Provides a simple API for developers to record domain-specific business metrics (e.g., `inventory_count`, `user_signup_event`).
+* **Auto-Instrumentation:** Automatically records standard request metrics without developer intervention via RED middleware.
+* **Custom Hooks:** Provides both fluent API and middleware chain for domain-specific business metrics (e.g., `inventory_count`, `user_signup_event`).
+* **Flexible Registration:** Manual metric registration supported alongside automatic collection.
 
 ### Layer 2: The Registry (Source of Truth)
 
-The Registry is a thread-safe (or performance-optimized) container that maintains the current state of the application's telemetry.
+The Registry is a thread-safe container that maintains the current state of the application's telemetry using non-blocking concurrency patterns.
 
-* **Concurrency Modes:**
-* `SafeMode`: Uses `sync.RWMutex` to handle high-concurrency environments.
-* `FastMode`: Uses `atomic` primitives and unsafe pointers for high-throughput, low-latency needs.
-
-
+* **Concurrency Model:** Uses bounded channels with `sync.RWMutex` for safe concurrent access without blocking request lifecycle.
+* **Context Management:** Context stored as Registry field for graceful shutdown.
 * **Storage Strategy:**
-* **Hot Ingestion:** RAM-based with atomic operations to prevent blocking the request lifecycle.
+* **Hot Ingestion:** RAM-based with non-blocking writes via bounded channel (drops if full).
+* **Memory Pool:** Fixed-size with LRU eviction and TTL-based expiration.
 * **Optional Persistence:** Background aggregation of raw metrics into summarized SQLite buckets for historical analysis.
-
-
+* **Roll-up Windows:** 1-minute, 5-minute, 1-hour, 1-day aggregated views.
 
 ### Layer 3: The Exposition Layer (Presentation & Export)
 
 This layer handles how the world sees your telemetry. It is designed to be "Swagger-like," where the documentation *is* the interface.
 
-* **HTMX UI:** An embedded, server-side rendered dashboard (mounted at `/metrics`) that provides an interactive, searchable view of metrics, using non-aggressive HTMX polling.
-* **OTLP Exporter:** Provides machine-readable interfaces (gRPC/HTTP) that comply with the OpenTelemetry standard, allowing for seamless integration with backends like Prometheus, Grafana Mimir, or VictoriaMetrics.
+* **HTMX UI:** An embedded, server-side rendered dashboard (mounted at `/metrics`) with:
+  - Pre-configured charts with add chart button + metric search
+  - Chart type defaults per metric type (Counter→Line, Gauge→Sparkline, Histogram→Bar)
+  - Customizable chart name, time interval, and alert thresholds
+  - Non-aggressive HTMX polling (configurable, default 5s)
+* **OTLP Exporter:** HTTP-based export (gRPC deferred to separate sub-package) complying with OpenTelemetry standard for integration with Prometheus, Grafana Mimir, or VictoriaMetrics.
 
 ---
 
 ## 3. Core Features
 
-* **"Swagger-Inspired" Discovery:** View all registered metrics and their definitions via a clean, auto-generated browser interface.
-* **Flexible Telemetry (The Freedom Principle):** Users choose their persistence model (RAM only vs. local SQLite) and their export protocol (OTLP gRPC vs. OTLP HTTP).
-* **Non-Aggressive Polling:** UI refreshes are triggered by HTMX on a customizable timer, defaulting to a low-impact 5-second interval.
-* **Performance Tiers:** Explicit configuration to toggle between thread-safe and non-concurrent operation modes.
+* **"Swagger-Inspired" Discovery:** View all registered metrics and their definitions via a clean, auto-generated browser interface with pre-configured charts.
+* **Flexible Configuration:** Struct-based config with YAML support. Blank fields use sensible defaults.
+* **Dual Hook API:** Both fluent registration and middleware chain patterns for metric collection.
+* **Zero-Blocking:** Non-blocking metric ingestion via bounded channels ensures request lifecycle is never impacted.
+* **High-Cardinality Safety:** Bucketed counts prevent cardinality explosion (no per-user metrics).
+* **Context-Based Lifecycle:** Graceful shutdown with context stored in Registry struct.
 
 ---
 
@@ -54,18 +58,21 @@ This layer handles how the world sees your telemetry. It is designed to be "Swag
 
 ### Developer Workflow
 
-1. **Initialize:** Define the `GoLens` registry with your desired concurrency strategy and optional persistence settings (e.g., SQLite path).
-2. **Mount:** Add the `GoLensMiddleware` to your router.
-3. **Consume:** * Access `/metrics` for the interactive HTMX dashboard.
-* Configure your OTEL backend (Prometheus/Grafana) to scrape the OTLP-compliant endpoints.
+1. **Initialize:** Create the `GoLens` registry with optional persistence settings (struct-based or YAML).
+2. **Mount:** Add the `GoLensMiddleware` to your router (compatible with all Go routers).
+3. **Configure:** Set include/exclude path patterns, polling interval, OTLP endpoint.
+4. **Consume:**
+  * Access `/metrics` for the interactive HTMX dashboard.
+  * Configure OTEL backend (Prometheus/Grafana) to scrape OTLP HTTP endpoints.
 
 
 
 ### Persistence Strategy
 
-* **In-Memory:** Primary storage for high-frequency ingestion.
-* **SQLite (Optional):** Used exclusively for **summarized data (roll-ups)** to provide historical insights (e.g., hourly averages) without impacting runtime performance.
+* **In-Memory:** Primary storage with fixed-size pool, LRU eviction, and TTL expiration.
+* **SQLite (Optional):** Used exclusively for **summarized data (roll-ups)** across multiple time windows (1m, 5m, 1h, 1d) without impacting runtime performance.
 * **OTLP:** The primary mechanism for **Production-Grade long-term storage**, shifting the burden of retention and query-heavy processing to purpose-built TSDBs.
+* **Migration:** No migration needed—toggle between in-memory and SQLite via config update.
 
 ---
 
@@ -73,7 +80,228 @@ This layer handles how the world sees your telemetry. It is designed to be "Swag
 
 | Component | Responsibility | Recommended Implementation |
 | --- | --- | --- |
-| **Ingestion** | Collect metrics | `sync/atomic` (Fast) or `RWMutex` (Safe) |
-| **Persistence** | Durability | OTLP (Remote) / SQLite (Local Summary) |
-| **UI** | Visualization | HTMX + `html/template` |
-| **Protocol** | Standard | OpenTelemetry (OTLP) |
+| **Ingestion** | Collect metrics | `sync.RWMutex` + bounded channels (non-blocking, drops when full) |
+| **Hooks** | Custom metrics | Fluent API + middleware chain (both supported) |
+| **Storage** | Durability | In-memory (LRU+TTL) + SQLite roll-ups (optional) + OTLP (production) |
+| **UI** | Visualization | HTMX + Alpine.js + `html/template` with pre-configured charts |
+| **Protocol** | Standard | OpenTelemetry (OTLP HTTP, gRPC deferred) |
+| **Config** | Settings | Struct-based + YAML, defaults for blank fields |
+| **Lifecycle** | Shutdown | Context stored in Registry struct |
+
+---
+
+## 6. Instructions
+
+### Install
+
+```bash
+go get golens
+```
+
+GoLens depends only on two pure-Go libraries at runtime (`gopkg.in/yaml.v3` for config and `modernc.org/sqlite` for optional persistence — no CGo).
+
+### Minimal usage (zero-config)
+
+```go
+package main
+
+import (
+    "context"
+    "net/http"
+
+    golens "golens"
+)
+
+func main() {
+    registry, _ := golens.New(golens.DefaultConfig())
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+    registry.Start(ctx)
+    defer registry.Close()
+
+    mux := http.NewServeMux()
+    registry.MountUI(mux) // dashboard at /metrics
+    mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+        w.WriteHeader(http.StatusOK)
+    })
+
+    http.ListenAndServe(":8080", registry.Middleware(mux))
+}
+```
+
+That's it — RED metrics (`http_requests_total`, `http_request_errors_total`, `http_request_duration_seconds`) are collected automatically, and the dashboard is live at `http://localhost:8080/metrics`.
+
+### Configuration
+
+Every field is optional; blank fields fall back to sensible defaults. Configure either in code or via YAML.
+
+**In code:**
+
+```go
+cfg := golens.DefaultConfig()
+cfg.OTLP.Enabled = true
+cfg.OTLP.Endpoint = "http://otel-collector:4318/v1/metrics"
+cfg.Storage.Backend = "sqlite"
+cfg.Storage.Path = "./golens.db"
+cfg.UI.PollInterval = 3 * time.Second
+cfg.ExcludePatterns = []string{"^/health$"}
+registry, _ := golens.New(cfg)
+```
+
+**Via YAML:**
+
+```go
+cfg, _ := golens.LoadConfig("golens.yaml")
+registry, _ := golens.New(cfg)
+```
+
+```yaml
+# golens.yaml
+storage:
+  backend: sqlite        # "memory" (default) or "sqlite"
+  path: ./golens.db
+  ttl: 24h
+
+otlp:
+  enabled: true
+  endpoint: http://otel-collector:4318/v1/metrics
+  protocol: http         # gRPC deferred
+  batch_size: 100
+  interval: 10s
+  timeout: 5s
+
+ui:
+  enabled: true
+  poll_interval: 5s
+
+ingest_queue_size: 4096  # saturation drops samples (never blocks requests)
+max_metrics: 10000       # in-memory series cap (LRU eviction)
+metric_ttl: 1h
+flush_interval: 30s
+
+include_patterns: []     # empty = track everything
+exclude_patterns:
+  - ^/health$
+  - ^/metrics
+
+debug: false             # set true / GOLENS_DEBUG=true for verbose logs
+```
+
+### Custom metrics
+
+Both styles are supported and feed the same Registry.
+
+**Fluent hook API** — extract values from the request:
+
+```go
+signupHook := registry.On("user_signup_event").
+    Type(golens.CounterType).
+    Description("user signups").
+    Labels("plan").
+    Extract(func(r *http.Request) (float64, []golens.Label) {
+        return 1, []golens.Label{{Name: "plan", Value: r.URL.Query().Get("plan")}}
+    })
+
+mux.Handle("/signup", signupHook(yourSignupHandler))
+```
+
+**Middleware chain** — apply only the RED pieces you want:
+
+```go
+router.Use(registry.RequestCountMiddleware)
+router.Use(registry.LatencyMiddleware)
+router.Use(registry.ErrorRateMiddleware)
+```
+
+**Manual registration** — record values anywhere in your code:
+
+```go
+orders := registry.Register("orders_created", golens.CounterType, "orders", []string{"sku"}, nil)
+orders.Record(1)
+// or via the hot path (non-blocking):
+registry.Record("orders_created", 1, golens.Label{Name: "sku", Value: "ABC"})
+```
+
+### Router integration
+
+The middleware is a standard `func(http.Handler) http.Handler`, so it works with any router (gorilla/mux, chi, stdlib) and with Gin by wrapping the engine:
+
+```go
+// chi
+r.Use(golensRegistry.Middleware)
+
+// gorilla/mux
+router.Use(golensRegistry.Middleware)
+
+// stdlib
+http.Handle("/", golensRegistry.Middleware(handler))
+
+// gin — wrap the whole engine; it satisfies http.Handler
+srv := &http.Server{Handler: golensRegistry.Middleware(engine)}
+```
+
+See `examples/gin` and `examples/stdlibmux` for complete, runnable servers. For
+routers that need per-route mounting (e.g. Gin), `MetricsHTTPHandler()` and
+`MetricsDataHTTPHandler()` expose the dashboard handlers individually.
+
+### Dashboard
+
+Open `/metrics`. The dashboard is server-side rendered with HTMX polling (default 5s) and Alpine.js for the search/add-chart/pause UX:
+
+- **Pre-configured charts** render automatically per metric type (Counter→line, Gauge→sparkline, Histogram→bar).
+- **Search** filters metrics by name.
+- **+ Add Chart** opens a modal with metric autocomplete.
+- **Pause** halts polling.
+- Programmatic JSON is available at `/metrics/data` (`Accept: application/json` or `?format=json`); a single metric at `/metrics/data?metric=<name>`.
+
+### Production export (OTLP)
+
+Point any OTLP/HTTP receiver (OTel Collector, Grafana Alloy, etc.) at GoLens. GoLens **pushes** batches on a configurable interval (default 10s) and on graceful shutdown:
+
+```yaml
+otlp:
+  enabled: true
+  endpoint: http://otel-collector:4318/v1/metrics
+```
+
+### Graceful shutdown
+
+GoLens stores the context on the Registry. Cancelling it triggers a final flush of roll-ups to storage and a final OTLP batch, then stops all goroutines:
+
+```go
+ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+defer cancel()
+registry.Start(ctx)
+// ... serve ...
+<-ctx.Done()
+registry.Close() // final flush, never hangs
+```
+
+### Running the examples
+
+Two example servers live under `examples/` — a stdlib `net/http` mux and a
+Gin server. Both expose the dashboard at `/metrics` on `:8080`.
+
+```bash
+make run-stdlib     # builds and runs examples/stdlibmux on :8080
+# or
+make run-gin        # builds and runs examples/gin on :8080
+
+# then visit http://localhost:8080/metrics
+curl http://localhost:8080/?fail=1     # generate an error
+curl http://localhost:8080/order?sku=ABC
+```
+
+### Development
+
+```bash
+make build         # compile all packages
+make test          # unit tests
+make test-race     # tests with the race detector
+make cover         # coverage summary (library target: 95%)
+make vet           # go vet
+make lint          # golangci-lint (if installed)
+make fmt           # gofmt + goimports
+```
+
+CI runs the build/vet/race-test/coverage matrix across Go 1.22–1.24 plus golangci-lint on every push and pull request (`.github/workflows/ci.yml`).

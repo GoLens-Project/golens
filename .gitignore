@@ -1,0 +1,23 @@
+# Binaries
+bin/
+*.exe
+
+# Test / coverage artifacts
+coverage.out
+coverage.html
+*.out
+
+# SQLite databases created by the demo / tests
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.swp

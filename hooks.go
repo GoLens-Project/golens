@@ -1,0 +1,124 @@
+package golens
+
+import (
+	"net/http"
+	"time"
+)
+
+// HookBuilder provides a fluent API for registering domain-specific metrics.
+//
+//	golens.On("user_signup_event").
+//	    Type(CounterType).
+//	    Description("user signups").
+//	    Labels("plan", "source").
+//	    Extract(func(r *http.Request) (float64, []Label) {
+//	        return 1, []Label{
+//	            {Name: "plan", Value: r.FormValue("plan")},
+//	            {Name: "source", Value: r.Header.Get("X-Source")},
+//	        }
+//	    })
+//
+// The builder and the middleware-chain middleware both feed into the same
+// Registry; both styles are supported.
+type HookBuilder struct {
+	registry *Registry
+	name     string
+	mtype    MetricType
+	desc     string
+	labels   []string
+	extract  ExtractFunc
+	bounds   []float64
+}
+
+// ExtractFunc returns the value to record and any labels for a given request.
+type ExtractFunc func(*http.Request) (float64, []Label)
+
+// On begins a fluent hook registration for the named metric.
+func (r *Registry) On(name string) *HookBuilder {
+	return &HookBuilder{
+		registry: r,
+		name:     name,
+		mtype:    CounterType,
+	}
+}
+
+// Type sets the metric kind.
+func (h *HookBuilder) Type(t MetricType) *HookBuilder {
+	h.mtype = t
+	return h
+}
+
+// Description sets the human-readable description.
+func (h *HookBuilder) Description(d string) *HookBuilder {
+	h.desc = d
+	return h
+}
+
+// Labels declares the label names this metric carries.
+func (h *HookBuilder) Labels(names ...string) *HookBuilder {
+	h.labels = names
+	return h
+}
+
+// Bounds sets histogram bucket boundaries (histograms only).
+func (h *HookBuilder) Bounds(b ...float64) *HookBuilder {
+	h.bounds = b
+	return h
+}
+
+// Extract attaches the value extraction function and finalizes registration,
+// returning an http.Handler middleware that records the metric when applied.
+func (h *HookBuilder) Extract(fn ExtractFunc) func(http.Handler) http.Handler {
+	h.extract = fn
+	h.registry.Register(h.name, h.mtype, h.desc, h.labels, h.bounds)
+	name := h.name
+	registry := h.registry
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if registry.shouldTrack(r.URL.Path) {
+				v, labels := fn(r)
+				registry.Record(name, v, labels...)
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// Convenience chain middlewares (the "middleware chain" style).
+func (r *Registry) RequestCountMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if r.shouldTrack(req.URL.Path) {
+			r.Record("http_requests_total", 1,
+				Label{Name: "method", Value: req.Method},
+				Label{Name: "path", Value: req.URL.Path},
+			)
+		}
+		next.ServeHTTP(w, req)
+	})
+}
+
+func (r *Registry) LatencyMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		start := time.Now()
+		next.ServeHTTP(w, req)
+		if r.shouldTrack(req.URL.Path) {
+			r.Record("http_request_duration_seconds", time.Since(start).Seconds(),
+				Label{Name: "method", Value: req.Method},
+				Label{Name: "path", Value: req.URL.Path},
+			)
+		}
+	})
+}
+
+func (r *Registry) ErrorRateMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		rec := &statusRecorder{ResponseWriter: w, status: 200}
+		next.ServeHTTP(rec, req)
+		if rec.status >= 400 && r.shouldTrack(req.URL.Path) {
+			r.Record("http_request_errors_total", 1,
+				Label{Name: "method", Value: req.Method},
+				Label{Name: "path", Value: req.URL.Path},
+			)
+		}
+	})
+}
