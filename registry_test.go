@@ -89,7 +89,7 @@ func TestRegistryEvictionRespectsMax(t *testing.T) {
 	r.Register("c", CounterType, "", nil, nil)
 
 	if _, ok := r.Snapshot("a"); ok {
-		// a may or may not be evicted depending on idle logic; c must exist
+		_ = ok // a may or may not be evicted depending on idle logic; c must exist
 	}
 	if _, ok := r.Snapshot("c"); !ok {
 		t.Error("newly registered metric c must exist after eviction")

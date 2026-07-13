@@ -35,10 +35,11 @@ jobs:
       - name: Build
         run: |
           go build .
-          go build -o /dev/null ./examples/stdlibmux
-          go build -o /dev/null ./examples/gin
-          go build -o /dev/null ./examples/authed-gin
-          go build -o /dev/null ./examples/api-auth-gin
+          go build -o /dev/null ./examples/api/stdlibmux
+          go build -o /dev/null ./examples/api/gin
+          go build -o /dev/null ./examples/api/authed-gin
+          go build -o /dev/null ./examples/api/api-auth-gin
+          go build -o /dev/null ./examples/requests
 
       - name: Vet
         run: go vet ./...

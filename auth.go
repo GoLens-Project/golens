@@ -51,7 +51,6 @@ func resolveAuth(a *AuthConfig) authState {
 	if user == "" || len(hash) == 0 {
 		return authState{}
 	}
-	a.enabled = true
 	return authState{username: user, hash: hash}
 }
 

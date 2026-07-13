@@ -95,8 +95,8 @@ func TestWaitForDrainTimeoutPath(t *testing.T) {
 	// Don't start loop: queue stays non-empty, waitForDrain must time out.
 	start := time.Now()
 	waitForDrain(r)
-	if time.Since(start) > 2*time.Second {
-		// tolerated
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Logf("waitForDrain took %v, expected timeout path", elapsed)
 	}
 	r.Close()
 }
