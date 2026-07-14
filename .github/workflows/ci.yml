@@ -7,6 +7,28 @@ on:
     branches: [main, master]
 
 jobs:
+  label-check:
+    name: Version label
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check for version label
+        run: |
+          LABELS=$(gh pr view ${{ github.event.pull_request.number }} --json labels --jq '.labels[].name')
+          for label in major minor patch; do
+            if echo "$LABELS" | grep -qx "$label"; then
+              echo "Found version label: $label"
+              exit 0
+            fi
+          done
+          echo "::error::No version label (major/minor/patch) on this PR. A maintainer must add one before merging."
+          exit 1
+        env:
+          GH_TOKEN: ${{ github.token }}
+
   test:
     name: Test
     runs-on: ubuntu-latest

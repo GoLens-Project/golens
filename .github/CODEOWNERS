@@ -1,0 +1,3 @@
+# Only maintainers can approve PRs.
+# This also means only they can add labels (write+ permission required by GitHub).
+* @ozzono
