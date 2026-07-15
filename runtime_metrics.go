@@ -71,10 +71,11 @@ func collectRuntime(r *Registry) {
 	r.Record(MetricGoHeapInuse, float64(ms.HeapInuse))
 	r.Record(MetricGoHeapObjects, float64(ms.HeapObjects))
 
-	// Show only application goroutines (total - baseline - continuous background goroutines)
-	// We subtract 2 to account for the main loop and runtime metrics collector goroutines
+	// Show only application goroutines. The baseline is captured in Start()
+	// before the loop/runtime-metrics goroutines are spawned, so it already
+	// excludes the background goroutines that appear after Start() returns.
 	totalGoroutines := runtime.NumGoroutine()
-	appGoroutines := totalGoroutines - r.GoroutineBaseline - 2
+	appGoroutines := totalGoroutines - r.GoroutineBaseline
 	if appGoroutines < 0 {
 		appGoroutines = 0 // Shouldn't happen, but safeguard
 	}

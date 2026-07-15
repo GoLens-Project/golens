@@ -220,3 +220,69 @@ func waitForDrain(r *Registry) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+func TestHistoryWithData(t *testing.T) {
+	r := newTestRegistry(t, DefaultConfig())
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	defer func() { cancel(); r.Close() }()
+
+	r.Record("history_metric", 10)
+	r.Record("history_metric", 20)
+	waitForDrain(r)
+
+	// Wait for at least one flush cycle (FlushInterval is 5ms in tests)
+	time.Sleep(20 * time.Millisecond)
+
+	series := r.History("history_metric", time.Hour)
+	if series.Name != "history_metric" {
+		t.Errorf("series name = %q, want history_metric", series.Name)
+	}
+	if len(series.Points) == 0 {
+		t.Error("History returned no points after flush")
+	}
+}
+
+func TestHistoryNoData(t *testing.T) {
+	r := newTestRegistry(t, DefaultConfig())
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	defer func() { cancel(); r.Close() }()
+
+	series := r.History("nonexistent", time.Hour)
+	if series.Name != "nonexistent" {
+		t.Errorf("series name = %q, want nonexistent", series.Name)
+	}
+	if len(series.Points) != 0 {
+		t.Errorf("expected 0 points, got %d", len(series.Points))
+	}
+}
+
+func TestHistoryNilContext(t *testing.T) {
+	r := newTestRegistry(t, DefaultConfig())
+	// Don't start — ctx is nil, History should fall back to context.Background()
+
+	series := r.History("anything", time.Hour)
+	if series.Name != "anything" {
+		t.Errorf("series name = %q", series.Name)
+	}
+}
+
+func TestHistoryHistogramBounds(t *testing.T) {
+	r := newTestRegistry(t, DefaultConfig())
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	defer func() { cancel(); r.Close() }()
+
+	bounds := []float64{1, 5, 10}
+	r.Register("hist_metric", HistogramType, "test histogram", nil, bounds, 0, 0)
+	r.Record("hist_metric", 3)
+	r.Record("hist_metric", 7)
+	waitForDrain(r)
+	time.Sleep(20 * time.Millisecond)
+
+	series := r.History("hist_metric", time.Hour)
+	if len(series.HistogramBounds) != len(bounds) {
+		t.Errorf("histogram bounds len = %d, want %d", len(series.HistogramBounds), len(bounds))
+	}
+}
