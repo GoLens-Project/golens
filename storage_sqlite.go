@@ -48,11 +48,9 @@ func newSQLiteStorage(path string) (*sqliteStorage, error) {
 		return nil, fmt.Errorf("golens: init sqlite schema: %w", err)
 	}
 
-	// Migration: Add histogram_buckets column if it doesn't exist (for existing databases)
-	if _, err := db.Exec(`ALTER TABLE metrics ADD COLUMN histogram_buckets TEXT`); err != nil {
-		// Ignore error if column already exists (SQLite returns error for duplicate ADD COLUMN)
-		// This is expected for existing databases that already have the column
-	}
+	// Migration: Add histogram_buckets column if it doesn't exist (for existing databases).
+	// SQLite returns an error for duplicate ADD COLUMN — that's expected and safe to ignore.
+	_, _ = db.Exec(`ALTER TABLE metrics ADD COLUMN histogram_buckets TEXT`)
 
 	return &sqliteStorage{db: db}, nil
 }

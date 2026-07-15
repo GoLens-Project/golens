@@ -89,8 +89,8 @@ func main() {
 		Type(golens.GaugeType).
 		Description("current CPU usage percentage").
 		Labels("source").
-		Min(0).    // CPU percentage: 0-100%
-		Max(100).  // CPU percentage: 0-100%
+		Min(0).   // CPU percentage: 0-100%
+		Max(100). // CPU percentage: 0-100%
 		Extract(func(req *http.Request) (float64, []golens.Label) {
 			// Simulate varying CPU usage for demo
 			usage := 30.0 + float64((len(req.URL.Path)*7)%60) // 30-90% range
@@ -106,8 +106,8 @@ func main() {
 		Type(golens.GaugeType).
 		Description("currently active connections").
 		Labels("endpoint").
-		Min(0).    // Minimum 0 connections
-		Max(50).   // Maximum 50 connections for demo
+		Min(0).  // Minimum 0 connections
+		Max(50). // Maximum 50 connections for demo
 		Extract(func(req *http.Request) (float64, []golens.Label) {
 			// Simulate tracking active connections by endpoint
 			endpoint := req.URL.Path
@@ -117,11 +117,12 @@ func main() {
 			// In a real app, you'd track actual connection count
 			// For demo, we return varied mock values to show gauge changes
 			connCount := 5.0 + float64(len(endpoint)%10) // Vary by endpoint
-			if endpoint == "/order" {
+			switch endpoint {
+			case "/order":
 				connCount = 12.0
-			} else if endpoint == "/connections" {
+			case "/connections":
 				connCount = 8.0
-			} else if endpoint == "/size" {
+			case "/size":
 				connCount = 3.0
 			}
 			return connCount, []golens.Label{{Name: "endpoint", Value: endpoint}}
@@ -145,11 +146,12 @@ func main() {
 				endpoint = "/"
 			}
 			connCount := 5.0 + float64(len(endpoint)%10) // Vary by endpoint
-			if endpoint == "/order" {
+			switch endpoint {
+			case "/order":
 				connCount = 12.0
-			} else if endpoint == "/connections" {
+			case "/connections":
 				connCount = 8.0
-			} else if endpoint == "/size" {
+			case "/size":
 				connCount = 3.0
 			}
 			log.Printf("[histogram] recording conn=%d for endpoint=%s", int(connCount), endpoint)
@@ -174,13 +176,14 @@ func main() {
 			}
 			// Different endpoints have different processing times
 			duration := 50.0 + float64((len(endpoint)*17)%150) // 50-200ms range
-			if endpoint == "/order" {
+			switch endpoint {
+			case "/order":
 				duration = 120.0
-			} else if endpoint == "/connections" {
+			case "/connections":
 				duration = 80.0
-			} else if endpoint == "/size" {
+			case "/size":
 				duration = 200.0
-			} else if endpoint == "/cpu" {
+			case "/cpu":
 				duration = 150.0
 			}
 			log.Printf("[histogram] processing time=%.0fms for endpoint=%s", duration, endpoint)
@@ -205,11 +208,12 @@ func main() {
 			}
 			// Simulate different response sizes for demo
 			size := 1024.0 + float64((len(endpoint)*128)%1024) // Varied sizes
-			if endpoint == "/order" {
+			switch endpoint {
+			case "/order":
 				size = 512.0
-			} else if endpoint == "/connections" {
+			case "/connections":
 				size = 256.0
-			} else if endpoint == "/size" {
+			case "/size":
 				size = 2048.0
 			}
 			log.Printf("[histogram] recording size=%.0f for endpoint=%s", size, endpoint)
