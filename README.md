@@ -51,6 +51,7 @@ This layer handles how the world sees your telemetry. It is designed to be "Swag
 * **Zero-Blocking:** Non-blocking metric ingestion via bounded channels ensures request lifecycle is never impacted.
 * **High-Cardinality Safety:** Bucketed counts prevent cardinality explosion (no per-user metrics).
 * **Context-Based Lifecycle:** Graceful shutdown with context stored in Registry struct.
+* **Histogram Time-Series:** Visualize histogram bucket distribution evolution over time with stacked area charts, enabling analysis of distribution trends and patterns.
 
 ---
 
@@ -184,6 +185,10 @@ exclude_patterns:
   - ^/health$
   - ^/metrics
 
+runtime_metrics:
+  enabled: true          # collect Go runtime stats (memory, goroutines)
+  interval: 15s
+
 debug: false             # set true / GOLENS_DEBUG=true for verbose logs
 ```
 
@@ -249,6 +254,7 @@ routers that need per-route mounting (e.g. Gin), `MetricsHTTPHandler()` and
 Open `/metrics`. The dashboard is server-side rendered with HTMX polling (default 5s) and Alpine.js for the search/add-chart/pause UX:
 
 - **Pre-configured charts** render automatically per metric type (Counter→line, Gauge→sparkline, Histogram→bar).
+- **Histogram Time-Series** section displays histogram bucket distribution evolution with stacked area charts, allowing analysis of how distributions change over time.
 - **Search** filters metrics by name.
 - **+ Add Chart** opens a modal with metric autocomplete.
 - **Pause** halts polling.
@@ -263,6 +269,33 @@ otlp:
   enabled: true
   endpoint: http://otel-collector:4318/v1/metrics
 ```
+
+### Go runtime metrics
+
+Optionally collect Go runtime stats as gauge metrics alongside your HTTP metrics:
+
+```yaml
+runtime_metrics:
+  enabled: true
+  interval: 15s
+```
+
+Or in code:
+
+```go
+cfg := golens.DefaultConfig()
+cfg.RuntimeMetrics.Enabled = true
+```
+
+Collected metrics:
+
+| Metric | Type | Description |
+|---|---|---|
+| `go_memstats_alloc_bytes` | Gauge | Currently allocated heap bytes |
+| `go_memstats_sys_bytes` | Gauge | Bytes obtained from the OS |
+| `go_memstats_heap_inuse_bytes` | Gauge | Bytes in active heap spans |
+| `go_memstats_heap_objects` | Gauge | Total number of allocated objects |
+| `go_goroutines` | Gauge | Current number of goroutines |
 
 ### Graceful shutdown
 
@@ -305,3 +338,8 @@ make fmt           # gofmt + goimports
 ```
 
 CI runs the build/vet/race-test/coverage matrix across Go 1.22–1.24 plus golangci-lint on every push and pull request (`.github/workflows/ci.yml`).
+
+## 8. Attribution
+
+### Favicon
+The GoLens dashboard favicon is sourced from [Flaticon](https://www.flaticon.com/free-icon/statistics_2920323) and is used under their [Free License](https://www.flaticon.com/license). Original icon by [Freepik](https://www.flaticon.com/authors/freepik).

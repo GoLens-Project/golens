@@ -68,8 +68,8 @@ func TestRegistryRecordAutoCreatesUnknownMetric(t *testing.T) {
 
 func TestRegistryRegisterReturnsExisting(t *testing.T) {
 	r := newTestRegistry(t, DefaultConfig())
-	m1 := r.Register("dup", CounterType, "first", nil, nil)
-	m2 := r.Register("dup", GaugeType, "second", nil, nil)
+	m1 := r.Register("dup", CounterType, "first", nil, nil, 0, 0)
+	m2 := r.Register("dup", GaugeType, "second", nil, nil, 0, 0)
 	if m1 != m2 {
 		t.Error("Register should return the existing metric on duplicate name")
 	}
@@ -83,10 +83,10 @@ func TestRegistryEvictionRespectsMax(t *testing.T) {
 	cfg.MaxMetrics = 2
 	r := newTestRegistry(t, cfg)
 
-	r.Register("a", CounterType, "", nil, nil)
-	r.Register("b", CounterType, "", nil, nil)
+	r.Register("a", CounterType, "", nil, nil, 0, 0)
+	r.Register("b", CounterType, "", nil, nil, 0, 0)
 	// exceeds cap -> eviction of idle metric (a, never recorded)
-	r.Register("c", CounterType, "", nil, nil)
+	r.Register("c", CounterType, "", nil, nil, 0, 0)
 
 	if _, ok := r.Snapshot("a"); ok {
 		_ = ok // a may or may not be evicted depending on idle logic; c must exist
@@ -102,13 +102,13 @@ func TestRegistryEvictionWithIdleTTL(t *testing.T) {
 	cfg.MetricTTL = 1 * time.Nanosecond
 	r := newTestRegistry(t, cfg)
 
-	old := r.Register("old_metric", CounterType, "", nil, nil)
+	old := r.Register("old_metric", CounterType, "", nil, nil, 0, 0)
 	old.Record(1)
 	time.Sleep(2 * time.Millisecond)
 	// forcing TTL: set last into the past
 	old.value.last.Store(1)
 
-	r.Register("new_metric", CounterType, "", nil, nil)
+	r.Register("new_metric", CounterType, "", nil, nil, 0, 0)
 	if _, ok := r.Snapshot("new_metric"); !ok {
 		t.Error("new metric should exist after idle eviction")
 	}
@@ -173,8 +173,8 @@ func TestRegistryNonBlockingUnderSaturation(t *testing.T) {
 
 func TestRegistrySnapshotsOrder(t *testing.T) {
 	r := newTestRegistry(t, DefaultConfig())
-	r.Register("z", CounterType, "", nil, nil)
-	r.Register("a", CounterType, "", nil, nil)
+	r.Register("z", CounterType, "", nil, nil, 0, 0)
+	r.Register("a", CounterType, "", nil, nil, 0, 0)
 	snaps := r.Snapshots()
 	// RED metrics first, then z, then a (insertion order)
 	found := []string{}

@@ -77,7 +77,7 @@ func TestSQLiteCloseAfterNew(t *testing.T) {
 }
 
 func TestHistogramOverflowOnly(t *testing.T) {
-	m := newMetric("h", HistogramType, "", nil, []float64{1})
+	m := newMetric("h", HistogramType, "", nil, []float64{1}, 0, 0)
 	m.Record(100)
 	m.Record(100)
 	s := m.Snapshot()

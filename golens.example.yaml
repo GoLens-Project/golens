@@ -49,5 +49,16 @@ exclude_patterns:
   - ^/metrics$
   - ^/favicon\.ico$
 
+# --- Project name ---
+# Custom name shown in the dashboard header. Defaults to "GoLens" if not set.
+project_name: GoLens
+
+# --- Go runtime metrics ---
+# Optional collection of Go runtime stats (memory, goroutines) as gauge
+# metrics visible in the /metrics dashboard.
+runtime_metrics:
+  enabled: false               # set true to collect runtime stats
+  interval: 15s                # collection cadence
+
 # --- Diagnostics ---
 debug: false                 # verbose logging of record/drop/flush/export

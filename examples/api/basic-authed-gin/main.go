@@ -38,6 +38,7 @@ func main() {
 	// Built-in auth is intentionally left off — the Gin middleware below owns
 	// access control. This is what "API-Only mode" means in the README.
 	cfg := golens.DefaultConfig()
+	cfg.RuntimeMetrics.Enabled = true
 
 	registry, err := golens.New(cfg)
 	if err != nil {
@@ -75,6 +76,8 @@ func main() {
 		metrics.GET("/data", gin.WrapF(registry.DataHandler))
 		// Per-endpoint latency JSON for the percentile chart.
 		metrics.GET("/endpoints", gin.WrapH(registry.EndpointsHTTPHandler()))
+		// Runtime metrics history for time-series charts.
+		metrics.GET("/history", gin.WrapH(registry.HistoryHTTPHandler()))
 	}
 
 	// GoLens's RED middleware still wraps the whole engine.

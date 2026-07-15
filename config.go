@@ -10,10 +10,12 @@ import (
 // Config is the top-level GoLens configuration. Every field is optional; a
 // zero-value Config produces a working, in-memory-only registry.
 type Config struct {
-	Storage StorageConfig `yaml:"storage"`
-	OTLP    OTLPConfig    `yaml:"otlp"`
-	UI      UIConfig      `yaml:"ui"`
-	Debug   bool          `yaml:"debug"`
+	Storage        StorageConfig        `yaml:"storage"`
+	OTLP           OTLPConfig           `yaml:"otlp"`
+	UI             UIConfig             `yaml:"ui"`
+	RuntimeMetrics RuntimeMetricsConfig `yaml:"runtime_metrics"`
+	ProjectName    string               `yaml:"project_name"`
+	Debug          bool                 `yaml:"debug"`
 
 	// IngestQueueSize bounds the non-blocking ingestion channel. When full,
 	// new samples are dropped to protect the request lifecycle.
@@ -57,6 +59,12 @@ type UIConfig struct {
 	Enabled      bool          `yaml:"enabled"`
 	PollInterval time.Duration `yaml:"poll_interval"`
 	Auth         AuthConfig    `yaml:"auth"`
+}
+
+// RuntimeMetricsConfig controls optional Go runtime metrics collection.
+type RuntimeMetricsConfig struct {
+	Enabled  bool          `yaml:"enabled"`
+	Interval time.Duration `yaml:"interval"` // collection interval, default 15s
 }
 
 // AuthConfig enables optional admin-only HTTP Basic Auth on the dashboard.
@@ -110,6 +118,7 @@ func DefaultConfig() Config {
 			Enabled:      true,
 			PollInterval: 5 * time.Second,
 		},
+		ProjectName:     "GoLens",
 		IngestQueueSize: 4096,
 		MaxMetrics:      10_000,
 		MaxEndpoints:    128,
@@ -179,5 +188,8 @@ func (c *Config) applyDefaults() {
 	}
 	if c.FlushInterval == 0 {
 		c.FlushInterval = 30 * time.Second
+	}
+	if c.RuntimeMetrics.Interval == 0 {
+		c.RuntimeMetrics.Interval = 15 * time.Second
 	}
 }

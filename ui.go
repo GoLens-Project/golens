@@ -6,6 +6,8 @@ import (
 	"html/template"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 )
 
 // MountUI registers the HTMX dashboard routes on the given mux. The dashboard
@@ -35,9 +37,12 @@ func (r *Registry) MountUI(mux *http.ServeMux) {
 	mux.Handle("/metrics", wrap(r.DashboardHandler))
 	mux.Handle("/metrics/data", wrap(r.DataHandler))
 	mux.Handle("/metrics/data/", wrap(r.DataHandler))
+	mux.Handle("/metrics/hooks", wrap(r.HooksHandler))
 	mux.Handle("/metrics/endpoints", wrap(func(w http.ResponseWriter, req *http.Request) {
 		writeJSON(w, r.EndpointLatency())
 	}))
+	mux.Handle("/metrics/history", wrap(r.metricsHistoryHandler()))
+	mux.Handle("/favicon.ico", wrap(r.faviconHandler))
 }
 
 // DashboardHandler is the raw, unprotected handler that renders the main
@@ -51,6 +56,12 @@ func (r *Registry) DashboardHandler(w http.ResponseWriter, req *http.Request) {
 // or HTMX fragment). Exposed for custom-middleware wrapping.
 func (r *Registry) DataHandler(w http.ResponseWriter, req *http.Request) {
 	r.metricsDataHandler().ServeHTTP(w, req)
+}
+
+// HooksHandler is the raw, unprotected handler for /metrics/hooks (JSON snapshot
+// or HTMX fragment). Exposed for custom-middleware wrapping.
+func (r *Registry) HooksHandler(w http.ResponseWriter, req *http.Request) {
+	r.hooksDataHandler().ServeHTTP(w, req)
 }
 
 // EndpointsHTTPHandler returns per-endpoint latency snapshots (p50/p95/p99) as
@@ -82,6 +93,15 @@ func (r *Registry) MetricsDataHTTPHandler() http.Handler {
 	return r.metricsDataHandler()
 }
 
+// HistoryHTTPHandler returns the metrics history handler for time-series data.
+// Returns nil if the UI is disabled.
+func (r *Registry) HistoryHTTPHandler() http.Handler {
+	if !r.cfg.UI.Enabled {
+		return nil
+	}
+	return r.metricsHistoryHandler()
+}
+
 // metricsPageHandler renders the full dashboard shell. The card grid is
 // refreshed by HTMX polling /metrics/data.
 func (r *Registry) metricsPageHandler() http.Handler {
@@ -91,10 +111,13 @@ func (r *Registry) metricsPageHandler() http.Handler {
 			intervalMs = 5000
 		}
 		data := map[string]interface{}{
-			"PollMs":   intervalMs,
-			"PollSec":  intervalMs / 1000,
-			"Cards":    buildCards(r.Snapshots()),
-			"Interval": r.cfg.UI.PollInterval.String(),
+			"PollMs":          intervalMs,
+			"PollSec":         intervalMs / 1000,
+			"Cards":           buildCards(r.Snapshots()),
+			"HookCards":       buildHookCards(r.Snapshots()),
+			"Interval":        r.cfg.UI.PollInterval.String(),
+			"RuntimeEnabled":  r.cfg.RuntimeMetrics.Enabled,
+			"ProjectName":     r.cfg.ProjectName,
 		}
 		// Render to a buffer first so a template error never produces a
 		// half-written response (which would force a superfluous WriteHeader).
@@ -131,6 +154,54 @@ func (r *Registry) metricsDataHandler() http.Handler {
 	})
 }
 
+var defaultDurations = map[string]time.Duration{
+	"5m":  5 * time.Minute,
+	"30m": 30 * time.Minute,
+	"1h":  time.Hour,
+	"4h":  4 * time.Hour,
+	"12h": 12 * time.Hour,
+	"24h": 24 * time.Hour,
+	"1w":  7 * 24 * time.Hour,
+}
+
+func (r *Registry) metricsHistoryHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		name := req.URL.Query().Get("name")
+		if name == "" {
+			http.Error(w, "missing ?name= parameter", http.StatusBadRequest)
+			return
+		}
+		durStr := req.URL.Query().Get("duration")
+		if durStr == "" {
+			durStr = "1h"
+		}
+		dur, ok := defaultDurations[durStr]
+		if !ok {
+			http.Error(w, "invalid duration; use 5m,30m,1h,4h,12h,24h,1w", http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, r.History(name, dur))
+	}
+}
+
+// hooksDataHandler returns hook metrics as HTML fragment for HTMX
+func (r *Registry) hooksDataHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if wantsJSON(req) {
+			writeJSON(w, buildHookCards(r.Snapshots()))
+			return
+		}
+		// HTMX HTML fragment
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_ = chartsTpl.Execute(w, map[string]interface{}{"Cards": buildHookCards(r.Snapshots())})
+	})
+}
+
+// faviconHandler serves the favicon.ico file
+func (r *Registry) faviconHandler(w http.ResponseWriter, req *http.Request) {
+	http.ServeFile(w, req, "favicon.ico")
+}
+
 func wantsJSON(req *http.Request) bool {
 	for _, a := range []string{req.Header.Get("Accept"), req.URL.Query().Get("format")} {
 		if a == "json" || a == "application/json" {
@@ -159,6 +230,11 @@ type metricCard struct {
 	DisplayValue string // formatted numeric value
 	Unit         string // value unit label
 	Bars         []histBar
+	HTTPColumns  []httpColumn // for HTTP request cards
+	// Gauge-specific fields
+	NeedlePct   int    // 0..100 needle position for gauges
+	MinValue    float64 // minimum value for gauge scale
+	MaxValue    float64 // maximum value for gauge scale
 }
 
 type histBar struct {
@@ -167,21 +243,86 @@ type histBar struct {
 	Axis      string // axis label, e.g. "0.005" or "+Inf"
 }
 
+type httpColumn struct {
+	Label       string // e.g., "2xx", "3xx", "4xx", "5xx", "total"
+	Value       float64
+	DisplayValue string // formatted value
+	HeightPct   int    // 0..100 relative to total
+	ColorClass  string // tailwind color class
+}
+
 func buildCards(snaps []MetricSnapshot) []metricCard {
+	// Filter out individual metrics that are shown in Runtime Health charts and hooks
+	excludedMetrics := map[string]bool{
+		"go_memstats_alloc_bytes":      true,
+		"go_memstats_sys_bytes":        true,
+		"go_memstats_heap_inuse_bytes": true,
+		"go_memstats_heap_objects":     true,
+		"cpu_usage_percent":            true,
+		"go_goroutines":                 true,
+	}
+
 	cards := make([]metricCard, 0, len(snaps))
 	for _, s := range snaps {
+		// Skip HTTP metrics (they'll be grouped into a single card)
+		if isHTTPMetric(s.Name) {
+			continue
+		}
+		// Skip excluded metrics
+		if excludedMetrics[s.Name] {
+			continue
+		}
+		// Skip hook metrics (they go in the hooks section)
+		if isHookMetric(s.Name) {
+			continue
+		}
 		c := metricCard{Snapshot: s}
 		switch s.Type {
 		case "counter":
 			c.Badge = "COUNTER"
 			c.BadgeClass = "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
 			c.BarClass = "bg-emerald-500 hover:bg-emerald-400"
-			c.DisplayValue = fmtInt(s.Value)
+			c.DisplayValue = formatMetricValue(s.Name, s.Value)
 		case "gauge":
 			c.Badge = "GAUGE"
 			c.BadgeClass = "bg-sky-500/10 text-sky-400 border-sky-500/20"
 			c.BarClass = "bg-sky-500 hover:bg-sky-400"
-			c.DisplayValue = fmtFloat(s.Value)
+			c.DisplayValue = formatMetricValue(s.Name, s.Value)
+			// Use configured min/max or apply smart defaults
+			minVal := s.GaugeMin
+			maxVal := s.GaugeMax
+
+			// Smart defaults based on metric name patterns
+			if maxVal == 0 {
+				// Auto-detect reasonable max based on metric name
+				lowerName := strings.ToLower(s.Name)
+				if strings.Contains(lowerName, "percent") || strings.Contains(lowerName, "pct") || strings.Contains(lowerName, "_pct") {
+					maxVal = 100 // Percentage metrics
+				} else if strings.Contains(lowerName, "ratio") || strings.Contains(lowerName, "rate") {
+					maxVal = 1 // Ratio/rate metrics
+				} else if strings.Contains(lowerName, "bytes") || strings.Contains(lowerName, "mem") {
+					maxVal = s.Value * 2 // Memory metrics: 2x current value
+					if maxVal < 1024*1024 { maxVal = 1024*1024 } // Min 1MB
+				} else {
+					maxVal = s.Value * 1.5 // Default: 50% headroom
+					if maxVal < 10 { maxVal = 10 } // Minimum scale
+				}
+			}
+			if minVal == 0 && !strings.Contains(strings.ToLower(s.Name), "temp") {
+				minVal = 0 // Default to 0 unless it's a temperature-like metric
+			}
+
+			c.MaxValue = maxVal
+			c.MinValue = minVal
+			if maxVal > 0 {
+				c.NeedlePct = int((s.Value - minVal) / (maxVal - minVal) * 100)
+				if c.NeedlePct > 100 {
+					c.NeedlePct = 100
+				}
+				if c.NeedlePct < 0 {
+					c.NeedlePct = 0
+				}
+			}
 		case "histogram":
 			c.Badge = "HISTOGRAM"
 			c.BadgeClass = "bg-purple-500/10 text-purple-400 border-purple-500/20"
@@ -192,11 +333,209 @@ func buildCards(snaps []MetricSnapshot) []metricCard {
 		default:
 			c.Badge = "UNKNOWN"
 			c.BadgeClass = "bg-slate-500/10 text-slate-400 border-slate-500/20"
-			c.DisplayValue = fmtFloat(s.Value)
+			c.DisplayValue = formatMetricValue(s.Name, s.Value)
+		}
+		cards = append(cards, c)
+	}
+
+	// Add HTTP request card first if any HTTP metrics exist
+	if httpCards := buildHTTPCard(snaps); httpCards != nil {
+		cards = append(httpCards, cards...)
+	}
+
+	return cards
+}
+
+// buildHookCards creates cards for hook-related metrics
+func buildHookCards(snaps []MetricSnapshot) []metricCard {
+	cards := make([]metricCard, 0, len(snaps))
+	for _, s := range snaps {
+		if !isHookMetric(s.Name) {
+			continue
+		}
+		c := metricCard{Snapshot: s}
+		switch s.Type {
+		case "counter":
+			c.Badge = "COUNTER"
+			c.BadgeClass = "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+			c.BarClass = "bg-emerald-500 hover:bg-emerald-400"
+			c.DisplayValue = formatMetricValue(s.Name, s.Value)
+		case "gauge":
+			c.Badge = "GAUGE"
+			c.BadgeClass = "bg-sky-500/10 text-sky-400 border-sky-500/20"
+			c.BarClass = "bg-sky-500 hover:bg-sky-400"
+			c.DisplayValue = formatMetricValue(s.Name, s.Value)
+			// Use configured min/max or apply smart defaults
+			minVal := s.GaugeMin
+			maxVal := s.GaugeMax
+
+			// Smart defaults based on metric name patterns
+			if maxVal == 0 {
+				// Auto-detect reasonable max based on metric name
+				lowerName := strings.ToLower(s.Name)
+				if strings.Contains(lowerName, "percent") || strings.Contains(lowerName, "pct") || strings.Contains(lowerName, "_pct") {
+					maxVal = 100 // Percentage metrics
+				} else if strings.Contains(lowerName, "ratio") || strings.Contains(lowerName, "rate") {
+					maxVal = 1 // Ratio/rate metrics
+				} else if strings.Contains(lowerName, "bytes") || strings.Contains(lowerName, "mem") {
+					maxVal = s.Value * 2 // Memory metrics: 2x current value
+					if maxVal < 1024*1024 { maxVal = 1024*1024 } // Min 1MB
+				} else {
+					maxVal = s.Value * 1.5 // Default: 50% headroom
+					if maxVal < 10 { maxVal = 10 } // Minimum scale
+				}
+			}
+			if minVal == 0 && !strings.Contains(strings.ToLower(s.Name), "temp") {
+				minVal = 0 // Default to 0 unless it's a temperature-like metric
+			}
+
+			c.MaxValue = maxVal
+			c.MinValue = minVal
+			if maxVal > 0 {
+				c.NeedlePct = int((s.Value - minVal) / (maxVal - minVal) * 100)
+				if c.NeedlePct > 100 {
+					c.NeedlePct = 100
+				}
+				if c.NeedlePct < 0 {
+					c.NeedlePct = 0
+				}
+			}
+		case "histogram":
+			c.Badge = "HISTOGRAM"
+			c.BadgeClass = "bg-purple-500/10 text-purple-400 border-purple-500/20"
+			c.BarClass = "bg-purple-500 hover:bg-purple-400"
+			c.DisplayValue = fmtInt(float64(s.Count))
+			c.Unit = "samples"
+			c.Bars = buildBars(s.Buckets)
+		default:
+			c.Badge = "UNKNOWN"
+			c.BadgeClass = "bg-slate-500/10 text-slate-400 border-slate-500/20"
+			c.DisplayValue = formatMetricValue(s.Name, s.Value)
 		}
 		cards = append(cards, c)
 	}
 	return cards
+}
+
+// isHookMetric returns true if the metric name suggests it's hook-related
+func isHookMetric(name string) bool {
+	lowerName := strings.ToLower(name)
+	return strings.Contains(lowerName, "hook") || strings.Contains(lowerName, "webhook")
+}
+
+// isHTTPMetric returns true if the metric name suggests it's HTTP request related
+func isHTTPMetric(name string) bool {
+	lowerName := strings.ToLower(name)
+	return strings.Contains(lowerName, "http") || strings.Contains(lowerName, "request") || strings.Contains(lowerName, "response")
+}
+
+// buildHTTPCard creates a single card grouping all HTTP request metrics by status
+func buildHTTPCard(snaps []MetricSnapshot) []metricCard {
+	// Categorize HTTP metrics by examining their labels for status codes
+	var sum2xx, sum3xx, sum4xx, sum5xx, sumErrors, sumOther float64
+	sum2xx, sum3xx, sum4xx, sum5xx, sumErrors, sumOther = 0, 0, 0, 0, 0, 0
+
+	for _, s := range snaps {
+		if !isHTTPMetric(s.Name) {
+			continue
+		}
+		lowerName := strings.ToLower(s.Name)
+
+		// Skip error-specific metrics, we'll count them separately
+		if strings.Contains(lowerName, "error") {
+			sumErrors += s.Value
+			continue
+		}
+
+		// Check labels for status codes
+		categorized := false
+		for _, lv := range s.LabelValues {
+			if lv.Name == "status" {
+				statusCode := lv.Value
+				// Categorize by status code range
+				if strings.HasPrefix(statusCode, "2") {
+					sum2xx += s.Value
+					categorized = true
+					break
+				} else if strings.HasPrefix(statusCode, "3") {
+					sum3xx += s.Value
+					categorized = true
+					break
+				} else if strings.HasPrefix(statusCode, "4") {
+					sum4xx += s.Value
+					categorized = true
+					break
+				} else if strings.HasPrefix(statusCode, "5") {
+					sum5xx += s.Value
+					categorized = true
+					break
+				}
+			}
+		}
+
+		// If not categorized by status code, add to other
+		if !categorized {
+			sumOther += s.Value
+		}
+	}
+
+	// Only show the card if we have HTTP metrics
+	totalHTTP := sum2xx + sum3xx + sum4xx + sum5xx + sumErrors + sumOther
+	if totalHTTP == 0 {
+		return nil
+	}
+
+	// Create columns for the chart
+	columns := []httpColumn{
+		{Label: "2xx", Value: sum2xx, ColorClass: "bg-emerald-500"},
+		{Label: "3xx", Value: sum3xx, ColorClass: "bg-blue-500"},
+		{Label: "4xx", Value: sum4xx, ColorClass: "bg-amber-500"},
+		{Label: "5xx", Value: sum5xx, ColorClass: "bg-rose-500"},
+		{Label: "errors", Value: sumErrors, ColorClass: "bg-red-500"},
+		{Label: "total", Value: totalHTTP, ColorClass: "bg-slate-400"},
+	}
+
+	// Format display values for columns
+	for i := range columns {
+		columns[i].DisplayValue = formatCount(columns[i].Value)
+	}
+
+	// Calculate heights relative to the maximum value
+	maxVal := 0.0
+	for _, col := range columns {
+		if col.Value > maxVal {
+			maxVal = col.Value
+		}
+	}
+
+	for i := range columns {
+		if maxVal > 0 {
+			columns[i].HeightPct = int((columns[i].Value / maxVal) * 100)
+			if columns[i].HeightPct < 2 {
+				columns[i].HeightPct = 2 // Minimum visible height
+			}
+		}
+	}
+
+	// Create a single card with all HTTP metrics
+	card := metricCard{
+		Snapshot:     MetricSnapshot{Name: "http_requests_total", Description: "HTTP requests by status"},
+		Badge:        "COUNTER",
+		BadgeClass:   "bg-emerald-500/10 text-emerald-400 border-emerald-500/20",
+		DisplayValue: fmtInt(totalHTTP),
+		Unit:         "requests",
+		HTTPColumns:  columns,
+	}
+
+	return []metricCard{card}
+}
+
+func sumMetrics(snaps []MetricSnapshot) float64 {
+	sum := 0.0
+	for _, s := range snaps {
+		sum += s.Value
+	}
+	return sum
 }
 
 // buildBars turns histogram buckets into render-ready bars. The busiest bucket
@@ -239,6 +578,49 @@ func fmtFloat(v float64) string {
 	return strconv.FormatFloat(v, 'f', 2, 64)
 }
 
+// formatMetricValue applies intelligent formatting based on metric name patterns.
+// Memory-related metrics get byte formatting (KB/MB/GB), large counts get K/M suffixes.
+func formatMetricValue(name string, v float64) string {
+	// Memory-related metrics: use byte formatting
+	lowerName := strings.ToLower(name)
+	if strings.Contains(lowerName, "bytes") || strings.Contains(lowerName, "alloc") ||
+		strings.Contains(lowerName, "heap") || strings.Contains(lowerName, "memstats") ||
+		strings.Contains(lowerName, "sys") && strings.Contains(lowerName, "mem") {
+		return formatBytes(v)
+	}
+	// Large counts: use K/M formatting
+	if v >= 1000 {
+		return formatCount(v)
+	}
+	// Default: regular float formatting
+	return fmtFloat(v)
+}
+
+// formatBytes formats a byte value as KB/MB/GB
+func formatBytes(b float64) string {
+	if b < 1024 {
+		return strconv.FormatFloat(b, 'f', 0, 64) + " B"
+	}
+	if b < 1024*1024 {
+		return strconv.FormatFloat(b/1024, 'f', 1, 64) + " KB"
+	}
+	if b < 1024*1024*1024 {
+		return strconv.FormatFloat(b/(1024*1024), 'f', 1, 64) + " MB"
+	}
+	return strconv.FormatFloat(b/(1024*1024*1024), 'f', 2, 64) + " GB"
+}
+
+// formatCount formats a large number with K/M suffixes
+func formatCount(n float64) string {
+	if n < 1000 {
+		return strconv.FormatFloat(n, 'f', 0, 64)
+	}
+	if n < 1e6 {
+		return strconv.FormatFloat(n/1e3, 'f', 1, 64) + "K"
+	}
+	return strconv.FormatFloat(n/1e6, 'f', 1, 64) + "M"
+}
+
 // fmtBound formats a histogram bucket boundary with up to 3 decimals and no
 // trailing zeros, so 0.005 and 0.01 don't collide on the axis.
 func fmtBound(v float64) string {
@@ -264,7 +646,8 @@ const dashboardSrc = `<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GoLens Metrics</title>
+<link rel="icon" type="image/x-icon" href="/favicon.ico">
+<title>{{.ProjectName}} Metrics</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script>tailwind.config={theme:{extend:{fontFamily:{sans:['Inter','system-ui','sans-serif'],mono:['JetBrains Mono','ui-monospace','SFMono-Regular','Menlo','monospace']}}}}</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -318,7 +701,7 @@ const dashboardSrc = `<!DOCTYPE html>
   <div class="max-w-7xl mx-auto px-6 py-4 flex items-center gap-4 flex-wrap">
     <div class="flex items-center gap-2 mr-auto">
       <span class="inline-block w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
-      <h1 class="text-lg font-semibold tracking-tight">GoLens</h1>
+      <h1 class="text-lg font-semibold tracking-tight">{{.ProjectName}}</h1>
       <span class="text-xs text-slate-500 font-mono">discovery dashboard</span>
     </div>
     <input id="search" type="text" placeholder="Search metrics..."
@@ -342,11 +725,214 @@ const dashboardSrc = `<!DOCTYPE html>
     <!-- Theme toggle -->
     <button id="theme-toggle" title="toggle theme"
             onclick="toggleTheme()"
-            class="w-9 h-9 rounded-lg border border-slate-800 bg-slate-900 hover:bg-slate-800 text-slate-300 text-base flex items-center justify-center transition"></button>
+            class="w-9 h-9 rounded-lg border border-slate-800 bg-slate-900 hover:bg-slate-800 text-slate-300 text-base flex items-center justify-center transition">🌙</button>
   </div>
 </header>
 
 <main class="max-w-7xl mx-auto px-6 py-6">
+  {{if .RuntimeEnabled}}
+  <!-- Runtime Health: time-series charts for memory, CPU, goroutines -->
+  <section x-data="runtimeHealth({{.PollMs}})" class="mb-8" x-cloak>
+    <div class="flex items-center gap-2 mb-3 flex-wrap">
+      <h2 class="text-xs font-mono uppercase tracking-wider text-slate-500">Runtime Health</h2>
+      <span class="text-[10px] font-mono text-slate-600">· drag to reorder</span>
+      <div class="flex gap-1 ml-2">
+        <template x-for="d in ['5m','30m','1h','4h','12h','24h','1w']" :key="d">
+          <button @click="duration=d; refresh()"
+                  :class="duration===d ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30' : 'bg-slate-800 text-slate-500 border-slate-700 hover:bg-slate-700'"
+                  class="text-[10px] font-mono px-2 py-0.5 rounded border transition" x-text="d"></button>
+        </template>
+      </div>
+    </div>
+
+    <!-- Runtime charts container for drag-to-reorder -->
+    <div id="runtime-charts" class="space-y-5">
+      <!-- Memory Overview (full width) -->
+      <div draggable="true"
+           @dragstart="start(0)" @dragover.prevent @drop="drop(0)" @dragend="drag=null"
+           :class="drag===0 ? 'opacity-40 ring-2 ring-emerald-500/60' : ''"
+           class="bg-slate-900 border border-slate-800 rounded-xl p-5 cursor-grab active:cursor-grabbing">
+        <div class="flex items-center justify-between mb-1">
+          <span class="text-xs font-mono text-slate-400">Memory Overview</span>
+          <div class="flex gap-4">
+            <span class="text-xs font-mono text-slate-500">sys: <span x-text="fmtBytes(currentSysBytes)"></span></span>
+            <span class="text-xs font-mono text-slate-500">heap: <span x-text="fmtBytes(currentHeapInuse)"></span></span>
+            <span class="text-xs font-mono text-slate-500">alloc: <span x-text="fmtBytes(currentMem)"></span></span>
+            <span class="text-xs font-mono text-slate-500">obj: <span x-text="fmtCount(currentHeapObj)"></span></span>
+          </div>
+        </div>
+        <canvas id="rt-mem" class="w-full" height="100"></canvas>
+        <div class="flex justify-between text-[10px] font-mono text-slate-600 mt-1">
+          <span class="text-emerald-400">sys bytes</span>
+          <span class="text-teal-400">heap inuse</span>
+          <span class="text-blue-400">alloc bytes</span>
+          <span class="text-amber-400">heap objects (right)</span>
+        </div>
+      </div>
+
+      <!-- CPU and Goroutines in grid -->
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+        <!-- CPU -->
+        <div draggable="true"
+             @dragstart="start(1)" @dragover.prevent @drop="drop(1)" @dragend="drag=null"
+             :class="drag===1 ? 'opacity-40 ring-2 ring-emerald-500/60' : ''"
+             class="bg-slate-900 border border-slate-800 rounded-xl p-5 cursor-grab active:cursor-grabbing">
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-xs font-mono text-slate-400">CPU Usage</span>
+            <span class="text-xs font-mono text-slate-500" x-text="cpuPct.toFixed(1) + '%'"></span>
+          </div>
+          <canvas id="rt-cpu" class="w-full" height="120"></canvas>
+          <div class="flex justify-between text-[10px] font-mono text-slate-600 mt-1">
+            <span>cpu %</span><span>goroutines (right)</span>
+          </div>
+        </div>
+        <!-- Goroutines -->
+        <div draggable="true"
+             @dragstart="start(2)" @dragover.prevent @drop="drop(2)" @dragend="drag=null"
+             :class="drag===2 ? 'opacity-40 ring-2 ring-emerald-500/60' : ''"
+             class="bg-slate-900 border border-slate-800 rounded-xl p-5 cursor-grab active:cursor-grabbing">
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-xs font-mono text-slate-400">App Goroutines</span>
+            <span class="text-xs font-mono text-slate-500" x-text="currentGoro"></span>
+          </div>
+          <canvas id="rt-goro" class="w-full" height="120"></canvas>
+        </div>
+      </div>
+    </div>
+  </section>
+  {{end}}
+
+  <!-- Histogram Time-Series: bucket distribution evolution over time -->
+  <section x-data="histogramTimeSeries({{.PollMs}})" class="mb-8" x-cloak>
+    <div class="flex items-center gap-2 mb-3 flex-wrap">
+      <h2 class="text-xs font-mono uppercase tracking-wider text-purple-400">Histogram Time-Series</h2>
+      <span class="text-[10px] font-mono text-slate-600">· bucket distribution evolution</span>
+      <div class="flex gap-1 ml-2">
+        <template x-for="d in ['5m','30m','1h','4h','12h','24h','1w']" :key="d">
+          <button @click="duration=d; refresh()"
+                  :class="duration===d ? 'bg-purple-500/20 text-purple-400 border-purple-500/30' : 'bg-slate-800 text-slate-500 border-slate-700 hover:bg-slate-700'"
+                  class="text-[10px] font-mono px-2 py-0.5 rounded border transition" x-text="d"></button>
+        </template>
+      </div>
+    </div>
+
+    <!-- Histogram charts grid -->
+    <div id="histogram-timeseries" class="grid grid-cols-1 lg:grid-cols-2 gap-5">
+      <template x-for="metric in histogramMetrics" :key="metric.name">
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-xs font-mono text-purple-400" x-text="metric.name"></span>
+            <span class="text-xs font-mono text-slate-500" x-text="metric.description"></span>
+          </div>
+          <canvas :id="'hist-ts-' + metric.name" class="w-full" height="150"></canvas>
+          <div class="flex flex-wrap gap-2 text-[10px] font-mono text-slate-600 mt-1">
+            <template x-for="(bound, index) in metric.bounds" :key="index">
+              <span :class="getBucketColor(index)" x-text="'≤' + formatBound(bound)"></span>
+            </template>
+          </div>
+        </div>
+      </template>
+    </div>
+
+    <!-- Empty state -->
+    <div x-show="histogramMetrics.length === 0" class="bg-slate-900 border border-slate-800 rounded-xl p-8 text-center">
+      <p class="text-sm font-mono text-slate-500">No histogram metrics with time-series data found.</p>
+      <p class="text-xs font-mono text-slate-600 mt-2">Histogram metrics will appear here after data collection begins.</p>
+    </div>
+  </section>
+
+  {{if .HookCards}}
+  <!-- Hooks Section: webhook and lifecycle hook metrics -->
+  <section x-data="hooksSection({{.PollMs}})" class="mb-8" x-cloak>
+    <div class="flex items-center gap-2 mb-3">
+      <h2 class="text-xs font-mono uppercase tracking-wider text-slate-500">Hooks</h2>
+      <span class="text-[10px] font-mono text-slate-600">· drag to reorder</span>
+    </div>
+    <div id="hooks"
+         hx-get="/metrics/hooks"
+         hx-trigger="every {{.PollMs}}ms [!document.body.dataset.paused]"
+         hx-swap="innerHTML">
+      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+      {{range .HookCards}}
+      {{$c := .}}
+      {{$hist := eq .Snapshot.Type "histogram"}}
+      <div data-metric="{{.Snapshot.Name}}" draggable="true"
+           class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm hover:border-slate-700 transition flex flex-col justify-between cursor-grab active:cursor-grabbing {{if $hist}}md:col-span-2{{end}}">
+        <div>
+          <div class="flex items-center justify-between mb-2 gap-2">
+            <span class="text-[10px] font-mono font-semibold px-2 py-0.5 rounded-full border {{.BadgeClass}}">{{.Badge}}</span>
+            <span class="text-xs text-slate-500 font-mono truncate">{{.Snapshot.Name}}</span>
+          </div>
+          <p class="text-sm text-slate-400">{{or .Snapshot.Description "—"}}</p>
+        </div>
+
+        {{if $hist}}
+          <!-- histogram: CSS flexbox bar chart -->
+          <div class="flex items-end justify-between h-28 gap-1 border-b border-slate-800 mt-4 pb-1">
+            {{range .Bars}}
+            <div class="w-full rounded-t group relative cursor-pointer transition-all {{$c.BarClass}}" style="height:{{.HeightPct}}%">
+              <div class="opacity-0 group-hover:opacity-100 absolute -top-7 left-1/2 -translate-x-1/2 bg-slate-800 text-[10px] px-1.5 py-0.5 rounded font-mono whitespace-nowrap z-10 transition-opacity">{{.Label}}</div>
+            </div>
+            {{end}}
+          </div>
+          <div class="flex justify-between text-[10px] font-mono text-slate-600 mt-1">
+            {{range .Bars}}<span class="truncate">{{.Axis}}</span>{{end}}
+          </div>
+          <div class="flex justify-between text-[11px] font-mono text-slate-400 mt-2">
+            <span>count <span class="text-slate-200">{{.Snapshot.Count}}</span></span>
+            <span>sum <span class="text-slate-200">{{fmt .Snapshot.Sum}}s</span></span>
+            <span>avg <span class="text-slate-200">{{fmt .Snapshot.Avg}}s</span></span>
+          </div>
+        {{else if eq .Snapshot.Type "gauge"}}
+          <!-- gauge: semi-circle with red/green zones -->
+          <div class="mt-4">
+            <div class="relative w-40 h-20 mx-auto overflow-hidden">
+              <!-- Semi-circle gauge -->
+              <div class="absolute inset-0">
+                <!-- Red zone (danger) - left side -->
+                <svg viewBox="0 0 100 50" class="w-full h-full">
+                  <!-- Background arc -->
+                  <path d="M 10 50 A 40 40 0 0 1 90 50" fill="none" stroke="#1e293b" stroke-width="8"/>
+                  <!-- Red zone (0-50%) -->
+                  <path d="M 10 50 A 40 40 0 0 1 50 10" fill="none" stroke="#ef4444" stroke-width="8" stroke-dasharray="62.83" stroke-dashoffset="0"/>
+                  <!-- Green zone (50-100%) -->
+                  <path d="M 50 10 A 40 40 0 0 1 90 50" fill="none" stroke="#22c55e" stroke-width="8" stroke-dasharray="62.83" stroke-dashoffset="0"/>
+                  <!-- Needle -->
+                  <line x1="50" y1="50" x2="50" y2="10" stroke="white" stroke-width="2" transform="rotate({{if .NeedlePct}}{{.NeedlePct}}{{else}}0{{end}} 50 50)" style="transform-origin: 50px 50px;"/>
+                  <!-- Center dot -->
+                  <circle cx="50" cy="50" r="3" fill="white"/>
+                </svg>
+              </div>
+            </div>
+            <div class="flex items-baseline mt-2 justify-center">
+              <span class="text-4xl font-semibold tracking-tight text-white font-mono">{{.DisplayValue}}</span>
+              {{if .Unit}}<span class="text-xs text-slate-500 ml-1.5 font-mono">{{.Unit}}</span>{{end}}
+            </div>
+          </div>
+          {{if .Snapshot.LabelValues}}
+          <div class="mt-3 flex flex-wrap gap-1">
+            {{range .Snapshot.LabelValues}}<span class="text-[10px] font-mono px-1.5 py-0.5 bg-slate-800 text-slate-400 rounded">{{.Name}}={{.Value}}</span>{{end}}
+          </div>
+          {{end}}
+        {{else}}
+          <!-- counter: simple number display -->
+          <div class="mt-4 flex items-baseline">
+            <span class="text-4xl font-semibold tracking-tight text-white font-mono">{{.DisplayValue}}</span>
+            {{if .Unit}}<span class="text-xs text-slate-500 ml-1.5 font-mono">{{.Unit}}</span>{{end}}
+          </div>
+          {{if .Snapshot.LabelValues}}
+          <div class="mt-3 flex flex-wrap gap-1">
+            {{range .Snapshot.LabelValues}}<span class="text-[10px] font-mono px-1.5 py-0.5 bg-slate-800 text-slate-400 rounded">{{.Name}}={{.Value}}</span>{{end}}
+          </div>
+          {{end}}
+        {{end}}
+      </div>
+      {{end}}
+      </div>
+    </div>
+  </section>
+  {{end}}
+
   <!-- My Charts: pinned metrics, persisted in localStorage, drag-to-reorder,
        kept live by cloning the matching server-rendered card from #charts. -->
   <section x-show="$store.ui.charts.length" x-cloak
@@ -413,7 +999,7 @@ const dashboardSrc = `<!DOCTYPE html>
           <div class="flex items-end justify-between h-24 gap-4 border-b border-slate-800 pb-1">
             <template x-for="p in [{k:'p50',v:e.p50,c:'bg-emerald-500'},{k:'p95',v:e.p95,c:'bg-amber-500'},{k:'p99',v:e.p99,c:'bg-rose-500'}]" :key="p.k">
               <div class="flex-1 flex flex-col items-center justify-end h-full group relative">
-                <div :class="p.c" class="w-full rounded-t transition-all" :style="'height:'+h(p.v)+'%'"></div>
+                <div :class="p.c" class="w-full rounded-t transition-all" :style="'height:'+h(e,p.v)+'%'"></div>
                 <span class="absolute -top-5 text-[10px] font-mono text-slate-300 opacity-0 group-hover:opacity-100" x-text="fmt(p.v)+'s'"></span>
               </div>
             </template>
@@ -578,7 +1164,7 @@ const dashboardSrc = `<!DOCTYPE html>
   }
 
   // After each HTMX swap: restore custom order, reapply search filter, refresh pins.
-  document.body.addEventListener('htmx:afterSwap', () => { sortCharts(); applyFilter(); renderPinned(); });
+  document.body.addEventListener('htmx:afterSwap', () => { sortCharts(); applyFilter(); renderPinned(); initHooksDnD(); });
 
   function loadEpOrder(){ try { return JSON.parse(localStorage.getItem('golens.eporder') || '[]'); } catch(e){ return []; } }
   function saveEpOrder(o){ try { localStorage.setItem('golens.eporder', JSON.stringify(o)); } catch(e){} }
@@ -598,10 +1184,6 @@ const dashboardSrc = `<!DOCTYPE html>
         const idx = e => { const i = ord.indexOf(key(e)); return i < 0 ? Infinity : i; };
         return this.raw.slice().sort((a, b) => idx(a) - idx(b));
       },
-      get max(){
-        const m = Math.max.apply(null, this.raw.map(e => Math.max(e.p50, e.p95, e.p99)).concat([0.001]));
-        return m > 0 ? m : 0.001;
-      },
       load(){
         fetch('/metrics/endpoints').then(r => r.json()).then(d => { this.raw = d || []; }).catch(() => {});
       },
@@ -615,9 +1197,99 @@ const dashboardSrc = `<!DOCTYPE html>
         this.drag = null;
         this.bump++;
       },
-      h(v){ return Math.max(2, Math.round((v / this.max) * 100)); },
+      // Calculate height relative to each endpoint's p99 (the highest bar)
+      h(endpoint, value){
+        const max = endpoint.p99 || 0.001;
+        return Math.max(2, Math.round((value / max) * 100));
+      },
       fmt(v){ if (v >= 1) return v.toFixed(2); if (v >= 0.01) return v.toFixed(3); return v.toFixed(4); }
     };
+  }
+
+  // Hooks section: provides drag-and-drop for hook metrics
+  function hooksSection(pollMs){
+    return {
+      drag: null,
+      init(){ this.setupDnD(); },
+      start(i){ this.drag = i; },
+      drop(i){
+        if (this.drag === null || this.drag === i) { this.drag = null; return; }
+        const grid = document.getElementById('hooks');
+        const cards = Array.from(grid.querySelectorAll(':scope > [data-metric]'));
+        if (this.drag < cards.length && i < cards.length) {
+          const dragged = cards[this.drag];
+          const target = cards[i];
+          const parent = dragged.parentNode;
+          const draggedNext = dragged.nextSibling;
+          const targetNext = target.nextSibling;
+          parent.insertBefore(dragged, targetNext);
+          parent.insertBefore(target, draggedNext);
+          // Save new order
+          const names = Array.from(grid.querySelectorAll(':scope > [data-metric]')).map(el => el.dataset.metric);
+          try { localStorage.setItem('golens.hooksorder', JSON.stringify(names)); } catch(e){}
+        }
+        this.drag = null;
+      },
+      setupDnD(){
+        const grid = document.getElementById('hooks');
+        if (!grid) return;
+        // Apply persisted order on load
+        try {
+          const saved = JSON.parse(localStorage.getItem('golens.hooksorder') || '[]');
+          if (saved.length > 0) {
+            const cards = Array.from(grid.querySelectorAll(':scope > [data-metric]'));
+            const idx = name => { const i = saved.indexOf(name); return i < 0 ? Infinity : i; };
+            cards.sort((a, b) => idx(a.dataset.metric) - idx(b.dataset.metric));
+            cards.forEach(c => grid.appendChild(c));
+          }
+        } catch(e){}
+        // Setup drag-and-drop
+        let dragCard = null;
+        grid.addEventListener('dragstart', e => {
+          const card = e.target.closest('[data-metric]');
+          if (!card) return;
+          dragCard = card;
+          card.classList.add('opacity-40', 'ring-2', 'ring-emerald-500/60');
+          e.dataTransfer.effectAllowed = 'move';
+        });
+        grid.addEventListener('dragend', e => {
+          const card = e.target.closest('[data-metric]');
+          if (card) { card.classList.remove('opacity-40', 'ring-2', 'ring-emerald-500/60'); }
+          dragCard = null;
+        });
+        grid.addEventListener('dragover', e => {
+          if (!dragCard) return;
+          const target = e.target.closest('[data-metric]');
+          if (!target || target === dragCard) return;
+          e.preventDefault();
+          const r = target.getBoundingClientRect();
+          const after = (e.clientY - r.top) > r.height / 2;
+          if (after) target.after(dragCard); else target.before(dragCard);
+        });
+        grid.addEventListener('drop', e => {
+          if (!dragCard) return;
+          e.preventDefault();
+          const names = Array.from(grid.querySelectorAll(':scope > [data-metric]')).map(el => el.dataset.metric);
+          try { localStorage.setItem('golens.hooksorder', JSON.stringify(names)); } catch(e){}
+        });
+      }
+    };
+  }
+
+  // Initialize hooks drag-and-drop (called after HTMX swaps)
+  function initHooksDnD(){
+    const grid = document.getElementById('hooks');
+    if (!grid) return;
+    // Apply persisted order
+    try {
+      const saved = JSON.parse(localStorage.getItem('golens.hooksorder') || '[]');
+      if (saved.length > 0) {
+        const cards = Array.from(grid.querySelectorAll(':scope > [data-metric]'));
+        const idx = name => { const i = saved.indexOf(name); return i < 0 ? Infinity : i; };
+        cards.sort((a, b) => idx(a.dataset.metric) - idx(b.dataset.metric));
+        cards.forEach(c => grid.appendChild(c));
+      }
+    } catch(e){}
   }
 
   // Boot: apply persisted All Metrics order + wire up its drag-and-drop.
@@ -651,6 +1323,460 @@ const dashboardSrc = `<!DOCTYPE html>
     requestAnimationFrame(frame);
     document.body.addEventListener('htmx:afterRequest', () => { start = performance.now(); });
   })();
+
+  // --- Runtime Health: time-series charts ---
+  function fmtBytes(b) {
+    if (b < 1024) return b.toFixed(0) + ' B';
+    if (b < 1024*1024) return (b/1024).toFixed(1) + ' KB';
+    if (b < 1024*1024*1024) return (b/(1024*1024)).toFixed(1) + ' MB';
+    return (b/(1024*1024*1024)).toFixed(2) + ' GB';
+  }
+  function fmtCount(n) {
+    if (n < 1000) return n.toString();
+    if (n < 1e6) return (n/1e3).toFixed(1) + 'K';
+    return (n/1e6).toFixed(1) + 'M';
+  }
+
+  function drawChart(canvasId, series, opts) {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    ctx.scale(dpr, dpr);
+    const W = rect.width, H = rect.height;
+    const pad = {top:8, right:opts.padRight||8, bottom:20, left:50};
+    const cw = W - pad.left - pad.right;
+    const ch = H - pad.top - pad.bottom;
+
+    ctx.clearRect(0, 0, W, H);
+    if (!series.length || !series[0].points.length) {
+      ctx.fillStyle = '#475569';
+      ctx.font = '11px JetBrains Mono, monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('no data yet', W/2, H/2);
+      return;
+    }
+
+    // compute global min/max across all series
+    let gMin = Infinity, gMax = -Infinity;
+    series.forEach(s => s.points.forEach(p => {
+      if (p.min !== undefined) gMin = Math.min(gMin, p.min);
+      if (p.max !== undefined) gMax = Math.max(gMax, p.max);
+      gMin = Math.min(gMin, p.v);
+      gMax = Math.max(gMax, p.v);
+    }));
+    if (gMin === gMax) { gMin *= 0.9; gMax *= 1.1; }
+    if (gMin === 0 && gMax === 0) { gMax = 1; }
+    const range = gMax - gMin;
+
+    // time range
+    let tMin = Infinity, tMax = -Infinity;
+    series[0].points.forEach(p => { tMin = Math.min(tMin, p.t); tMax = Math.max(tMax, p.t); });
+    const tRange = tMax - tMin || 1;
+
+    function xPos(t) { return pad.left + ((t - tMin) / tRange) * cw; }
+    function yPos(v) { return pad.top + ch - ((v - gMin) / range) * ch; }
+
+    // grid lines
+    ctx.strokeStyle = '#1e293b';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const y = pad.top + (ch * i / 4);
+      ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + cw, y); ctx.stroke();
+    }
+
+    // Y-axis labels
+    ctx.fillStyle = '#475569';
+    ctx.font = '10px JetBrains Mono, monospace';
+    ctx.textAlign = 'right';
+    for (let i = 0; i <= 4; i++) {
+      const v = gMax - (range * i / 4);
+      const y = pad.top + (ch * i / 4);
+      ctx.fillText((opts.fmtY || fmtCount)(v), pad.left - 6, y + 3);
+    }
+
+    // X-axis labels
+    ctx.textAlign = 'center';
+    const steps = Math.min(series[0].points.length, 6);
+    for (let i = 0; i <= steps; i++) {
+      const t = tMin + (tRange * i / steps);
+      const x = xPos(t);
+      const d = new Date(t * 1000);
+      const label = d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
+      ctx.fillText(label, x, pad.top + ch + 14);
+    }
+
+    // draw each series
+    const colors = ['#34d399', '#38bdf8', '#f59e0b', '#f472b6'];
+    series.forEach((s, si) => {
+      const color = colors[si % colors.length];
+      const pts = s.points;
+      if (!pts.length) return;
+
+      // min/max band
+      if (pts[0].min !== undefined) {
+        ctx.fillStyle = color + '15';
+        ctx.beginPath();
+        ctx.moveTo(xPos(pts[0].t), yPos(pts[0].max));
+        pts.forEach(p => ctx.lineTo(xPos(p.t), yPos(p.max)));
+        for (let i = pts.length - 1; i >= 0; i--) ctx.lineTo(xPos(pts[i].t), yPos(pts[i].min));
+        ctx.closePath();
+        ctx.fill();
+      }
+
+      // line
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      pts.forEach((p, i) => {
+        const x = xPos(p.t), y = yPos(p.v);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+
+      // end dot
+      const last = pts[pts.length - 1];
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(xPos(last.t), yPos(last.v), 3, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+
+  function runtimeHealth(pollMs) {
+    const metrics = [
+      {key:'go_memstats_sys_bytes'},
+      {key:'go_memstats_heap_inuse_bytes'},
+      {key:'go_memstats_alloc_bytes'},
+      {key:'go_memstats_heap_objects'},
+      {key:'cpu_usage_percent'},
+      {key:'go_goroutines'}
+    ];
+    return {
+      duration: '1h',
+      series: {},
+      currentSysBytes: 0, currentHeapInuse: 0, currentMem: 0, currentHeapObj: 0, cpuPct: 0, currentGoro: 0,
+      drag: null,
+      init() { this.refresh(); setInterval(() => this.refresh(), pollMs); },
+      start(i){ this.drag = i; },
+      drop(i){
+        if(this.drag === null || this.drag === i){ this.drag = null; return; }
+        // Reorder the runtime charts by swapping their positions in the DOM
+        const container = document.getElementById('runtime-charts');
+        const cards = container.querySelectorAll(':scope > div, :scope > div > div');
+        if(this.drag < cards.length && i < cards.length){
+          const dragged = cards[this.drag];
+          const target = cards[i];
+          const parent = dragged.parentNode;
+          const draggedNext = dragged.nextSibling;
+          const targetNext = target.nextSibling;
+          parent.insertBefore(dragged, targetNext);
+          parent.insertBefore(target, draggedNext);
+        }
+        this.drag = null;
+      },
+      refresh() {
+        metrics.forEach(m => {
+          fetch('/metrics/history?name=' + m.key + '&duration=' + this.duration)
+            .then(r => r.json())
+            .then(d => {
+              this.series[m.key] = d.points || [];
+              // update current values from last point
+              if (d.points && d.points.length) {
+                const last = d.points[d.points.length - 1].v;
+                if (m.key === 'go_memstats_sys_bytes') this.currentSysBytes = last;
+                if (m.key === 'go_memstats_heap_inuse_bytes') this.currentHeapInuse = last;
+                if (m.key === 'go_memstats_alloc_bytes') this.currentMem = last;
+                if (m.key === 'go_memstats_heap_objects') this.currentHeapObj = last;
+                if (m.key === 'cpu_usage_percent') this.cpuPct = last;
+                if (m.key === 'go_goroutines') this.currentGoro = Math.round(last);
+              }
+              this.draw();
+            }).catch(() => {});
+        });
+        // also fetch current snapshot for live values
+        fetch('/metrics/data?format=json').then(r => r.json()).then(snaps => {
+          (snaps||[]).forEach(s => {
+            if (s.Name === 'go_memstats_sys_bytes') this.currentSysBytes = s.Value;
+            if (s.Name === 'go_memstats_heap_inuse_bytes') this.currentHeapInuse = s.Value;
+            if (s.Name === 'go_memstats_alloc_bytes') this.currentMem = s.Value;
+            if (s.Name === 'go_memstats_heap_objects') this.currentHeapObj = s.Value;
+            if (s.Name === 'cpu_usage_percent') this.cpuPct = s.Value;
+            if (s.Name === 'go_goroutines') this.currentGoro = Math.round(s.Value);
+          });
+        }).catch(() => {});
+      },
+      draw() {
+        // Memory: all 4 metrics (3 byte metrics on left axis, objects on right axis)
+        const memByteSeries = [
+          {points: this.series['go_memstats_sys_bytes']||[]},
+          {points: this.series['go_memstats_heap_inuse_bytes']||[]},
+          {points: this.series['go_memstats_alloc_bytes']||[]}
+        ];
+        drawChart('rt-mem', memByteSeries, {fmtY: fmtBytes, padRight: 50});
+        // overlay heap objects on same canvas with right axis
+        const heapObjPts = this.series['go_memstats_heap_objects']||[];
+        if (heapObjPts.length) {
+          const canvas = document.getElementById('rt-mem');
+          if (canvas) {
+            const ctx = canvas.getContext('2d');
+            const rect = canvas.getBoundingClientRect();
+            const W = rect.width, H = rect.height;
+            const pad = {top:8, right:50, bottom:20, left:50};
+            const cw = W - pad.left - pad.right;
+            const ch = H - pad.top - pad.bottom;
+            let tMin = Infinity, tMax = -Infinity;
+            memByteSeries.forEach(s => s.points.forEach(p => { tMin = Math.min(tMin, p.t); tMax = Math.max(tMax, p.t); }));
+            heapObjPts.forEach(p => { tMin = Math.min(tMin, p.t); tMax = Math.max(tMax, p.t); });
+            const tRange = tMax - tMin || 1;
+            let gMin = Infinity, gMax = -Infinity;
+            heapObjPts.forEach(p => { gMin = Math.min(gMin, p.v); gMax = Math.max(gMax, p.v); });
+            if (gMin === gMax) { gMin *= 0.9; gMax *= 1.1; }
+            const range = gMax - gMin;
+            function xP(t) { return pad.left + ((t - tMin) / tRange) * cw; }
+            function yP(v) { return pad.top + ch - ((v - gMin) / range) * ch; }
+            ctx.strokeStyle = '#f59e0b';
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([4, 3]);
+            ctx.beginPath();
+            heapObjPts.forEach((p, i) => { i===0 ? ctx.moveTo(xP(p.t), yP(p.v)) : ctx.lineTo(xP(p.t), yP(p.v)); });
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.fillStyle = '#f59e0b';
+            ctx.font = '10px JetBrains Mono, monospace';
+            ctx.textAlign = 'left';
+            for (let i = 0; i <= 4; i++) {
+              const v = gMax - (range * i / 4);
+              ctx.fillText(fmtCount(v), pad.left + cw + 4, pad.top + (ch * i / 4) + 3);
+            }
+          }
+        }
+        // CPU + goroutines (dual axis)
+        const cpuPts = this.series['cpu_usage_percent']||[];
+        const goroPts = this.series['go_goroutines']||[];
+        drawChart('rt-cpu', [{points:cpuPts}], {fmtY: v => v.toFixed(0)+'%', padRight: 40});
+        // overlay goroutines on same canvas
+        if (goroPts.length) {
+          const canvas = document.getElementById('rt-cpu');
+          if (canvas) {
+            const ctx = canvas.getContext('2d');
+            const rect = canvas.getBoundingClientRect();
+            const W = rect.width, H = rect.height;
+            const pad = {top:8, right:40, bottom:20, left:50};
+            const cw = W - pad.left - pad.right;
+            const ch = H - pad.top - pad.bottom;
+            let tMin = Infinity, tMax = -Infinity;
+            cpuPts.forEach(p => { tMin = Math.min(tMin, p.t); tMax = Math.max(tMax, p.t); });
+            goroPts.forEach(p => { tMin = Math.min(tMin, p.t); tMax = Math.max(tMax, p.t); });
+            const tRange = tMax - tMin || 1;
+            let gMin = Infinity, gMax = -Infinity;
+            goroPts.forEach(p => { gMin = Math.min(gMin, p.v); gMax = Math.max(gMax, p.v); });
+            if (gMin === gMax) { gMin *= 0.9; gMax *= 1.1; }
+            const range = gMax - gMin;
+            function xP(t) { return pad.left + ((t - tMin) / tRange) * cw; }
+            function yP(v) { return pad.top + ch - ((v - gMin) / range) * ch; }
+            ctx.strokeStyle = '#38bdf8';
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([4, 3]);
+            ctx.beginPath();
+            goroPts.forEach((p, i) => { i===0 ? ctx.moveTo(xP(p.t), yP(p.v)) : ctx.lineTo(xP(p.t), yP(p.v)); });
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.fillStyle = '#38bdf8';
+            ctx.font = '10px JetBrains Mono, monospace';
+            ctx.textAlign = 'left';
+            for (let i = 0; i <= 4; i++) {
+              const v = gMax - (range * i / 4);
+              ctx.fillText(Math.round(v).toString(), pad.left + cw + 4, pad.top + (ch * i / 4) + 3);
+            }
+          }
+        }
+        // Goroutines
+        drawChart('rt-goro', [{points: this.series['go_goroutines']||[]}], {fmtY: v => Math.round(v).toString()});
+      }
+    };
+  }
+
+  // Histogram Time-Series component
+  function histogramTimeSeries(pollMs) {
+    return {
+      pollMs: pollMs,
+      duration: '1h',
+      histogramMetrics: [],
+      timer: null,
+
+      init() {
+        this.refresh();
+        this.timer = setInterval(() => this.refresh(), this.pollMs);
+      },
+
+      async refresh() {
+        try {
+          // Fetch all histogram metrics from current data
+          const dataResp = await fetch('/metrics/data?format=json');
+          const metrics = await dataResp.json();
+          const histogramCards = (metrics || []).filter(c => c.Type === 'histogram');
+
+          // Build histogram metrics list
+          this.histogramMetrics = histogramCards.map(card => ({
+            name: card.Name,
+            description: card.Description || '',
+            bounds: (card.Buckets || []).map(b => b.UpperBound).filter(b => b > 0) // Extract bounds from buckets
+          }));
+
+          // Fetch time-series data for each histogram metric
+          for (const metric of this.histogramMetrics) {
+            const historyResp = await fetch('/metrics/history?name=' + encodeURIComponent(metric.name) + '&duration=' + this.duration);
+            const history = await historyResp.json();
+            metric.points = history.points || [];
+            metric.histogramBounds = history.histogram_bounds || [];
+
+            // Render stacked area chart
+            this.renderHistogramChart(metric);
+          }
+        } catch (e) {
+          console.error('Failed to fetch histogram time-series:', e);
+        }
+      },
+
+      renderHistogramChart(metric) {
+        const canvasId = 'hist-ts-' + metric.name;
+        const canvas = document.getElementById(canvasId);
+        if (!canvas || !metric.points.length) return;
+
+        const ctx = canvas.getContext('2d');
+        const rect = canvas.getBoundingClientRect();
+        const W = rect.width, H = rect.height;
+
+        // Handle high-DPI displays
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = W * dpr;
+        canvas.height = H * dpr;
+        ctx.scale(dpr, dpr);
+
+        const pad = {top: 15, right: 20, bottom: 30, left: 45};
+        const cw = W - pad.left - pad.right;
+        const ch = H - pad.top - pad.bottom;
+
+        // Clear canvas
+        ctx.clearRect(0, 0, W, H);
+
+        // Find time range
+        let tMin = Infinity, tMax = -Infinity;
+        metric.points.forEach(p => {
+          tMin = Math.min(tMin, p.t);
+          tMax = Math.max(tMax, p.t);
+        });
+        const tRange = tMax - tMin || 1;
+
+        // Find max bucket count across all buckets for Y-axis scaling
+        let maxCount = 0;
+        metric.points.forEach(p => {
+          if (p.histogram_buckets) {
+            p.histogram_buckets.forEach(b => {
+              maxCount = Math.max(maxCount, b.Count);
+            });
+          }
+        });
+        if (maxCount === 0) maxCount = 1;
+
+        // Purple color palette for buckets
+        const bucketColors = [
+          'rgba(168, 85, 247, 0.7)',   // purple-500
+          'rgba(139, 92, 246, 0.7)',   // violet-500
+          'rgba(124, 58, 237, 0.7)',   // violet-600
+          'rgba(109, 40, 217, 0.7)',   // violet-700
+          'rgba(88, 28, 135, 0.7)',    // violet-900
+          'rgba(192, 132, 252, 0.7)',  // purple-400
+          'rgba(216, 180, 254, 0.7)',  // purple-300
+        ];
+
+        // Helper functions
+        function xP(t) { return pad.left + ((t - tMin) / tRange) * cw; }
+        function yP(v) { return pad.top + ch - (v / maxCount) * ch; }
+
+        // Draw stacked area chart for each bucket
+        const numBuckets = metric.histogramBounds.length;
+        for (let bucketIdx = 0; bucketIdx < numBuckets; bucketIdx++) {
+          const bound = metric.histogramBounds[bucketIdx];
+          const color = bucketColors[bucketIdx % bucketColors.length];
+
+          ctx.beginPath();
+          ctx.moveTo(xP(tMin), yP(0));
+
+          // Build the stacked area
+          for (const pt of metric.points) {
+            if (!pt.histogram_buckets || !pt.histogram_buckets[bucketIdx]) continue;
+            const bucketData = pt.histogram_buckets[bucketIdx];
+            let cumulativeCount = 0;
+
+            // Sum counts for this bucket and all below it
+            for (let i = 0; i <= bucketIdx; i++) {
+              if (pt.histogram_buckets[i]) {
+                cumulativeCount += pt.histogram_buckets[i].Count;
+              }
+            }
+            ctx.lineTo(xP(pt.t), yP(cumulativeCount));
+          }
+
+          // Close the path
+          ctx.lineTo(xP(tMax), yP(0));
+          ctx.closePath();
+
+          ctx.fillStyle = color;
+          ctx.fill();
+        }
+
+        // Draw axes
+        ctx.strokeStyle = '#475569';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(pad.left, pad.top);
+        ctx.lineTo(pad.left, pad.top + ch);
+        ctx.lineTo(pad.left + cw, pad.top + ch);
+        ctx.stroke();
+
+        // Draw Y-axis labels
+        ctx.fillStyle = '#64748b';
+        ctx.font = '10px JetBrains Mono, monospace';
+        ctx.textAlign = 'right';
+        ctx.textBaseline = 'middle';
+        for (let i = 0; i <= 4; i++) {
+          const v = Math.round(maxCount * (1 - i / 4));
+          ctx.fillText(v.toString(), pad.left - 8, pad.top + (ch * i / 4));
+        }
+
+        // Draw X-axis labels (time)
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        const timeLabels = 5;
+        for (let i = 0; i < timeLabels; i++) {
+          const t = tMin + (tRange * i / (timeLabels - 1));
+          const x = pad.left + (cw * i / (timeLabels - 1));
+          const date = new Date(t * 1000);
+          const label = date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
+          ctx.fillText(label, x, pad.top + ch + 8);
+        }
+      },
+
+      getBucketColor(index) {
+        const colors = [
+          'text-purple-400', 'text-violet-400', 'text-violet-500',
+          'text-violet-600', 'text-violet-700', 'text-purple-300'
+        ];
+        return colors[index % colors.length];
+      },
+
+      formatBound(bound) {
+        if (bound >= 1) return bound.toFixed(0);
+        if (bound >= 0.01) return bound.toFixed(2);
+        return bound.toFixed(3);
+      }
+    };
+  }
 </script>
 </body>
 </html>`
@@ -663,8 +1789,9 @@ const cardsSrc = `{{define "cards"}}
 {{range .Cards}}
 {{$c := .}}
 {{$hist := eq .Snapshot.Type "histogram"}}
+{{$http := .HTTPColumns}}
 <div data-metric="{{.Snapshot.Name}}" draggable="true"
-     class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm hover:border-slate-700 transition flex flex-col justify-between cursor-grab active:cursor-grabbing {{if $hist}}md:col-span-2{{end}}">
+     class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm hover:border-slate-700 transition flex flex-col justify-between cursor-grab active:cursor-grabbing {{if $hist}}md:col-span-2{{end}} {{if $http}}md:col-span-2 lg:col-span-3{{end}}">
   <div>
     <div class="flex items-center justify-between mb-2 gap-2">
       <span class="text-[10px] font-mono font-semibold px-2 py-0.5 rounded-full border {{.BadgeClass}}">{{.Badge}}</span>
@@ -673,7 +1800,18 @@ const cardsSrc = `{{define "cards"}}
     <p class="text-sm text-slate-400">{{or .Snapshot.Description "—"}}</p>
   </div>
 
-  {{if $hist}}
+  {{if $http}}
+    <!-- HTTP request status column chart -->
+    <div class="flex items-end justify-between h-32 gap-3 mt-4 pb-1">
+      {{range .HTTPColumns}}
+      <div class="flex-1 flex flex-col items-center justify-end h-full">
+        <div class="w-full rounded-t {{.ColorClass}}" style="height:{{.HeightPct}}%"></div>
+        <span class="text-[10px] font-mono text-slate-600 mt-1 truncate">{{.Label}}</span>
+        <span class="text-[10px] font-mono text-slate-400">{{.DisplayValue}}</span>
+      </div>
+      {{end}}
+    </div>
+  {{else if $hist}}
     <!-- histogram: CSS flexbox bar chart -->
     <div class="flex items-end justify-between h-28 gap-1 border-b border-slate-800 mt-4 pb-1">
       {{range .Bars}}
@@ -690,8 +1828,38 @@ const cardsSrc = `{{define "cards"}}
       <span>sum <span class="text-slate-200">{{fmt .Snapshot.Sum}}s</span></span>
       <span>avg <span class="text-slate-200">{{fmt .Snapshot.Avg}}s</span></span>
     </div>
+  {{else if eq .Snapshot.Type "gauge"}}
+    <!-- gauge: semi-circle with red/green zones -->
+    <div class="mt-4">
+      <div class="relative w-40 h-20 mx-auto overflow-hidden">
+        <!-- Semi-circle gauge -->
+        <div class="absolute inset-0">
+          <svg viewBox="0 0 100 50" class="w-full h-full">
+            <!-- Background arc -->
+            <path d="M 10 50 A 40 40 0 0 1 90 50" fill="none" stroke="#1e293b" stroke-width="8"/>
+            <!-- Red zone (0-50%) -->
+            <path d="M 10 50 A 40 40 0 0 1 50 10" fill="none" stroke="#ef4444" stroke-width="8" stroke-dasharray="62.83" stroke-dashoffset="0"/>
+            <!-- Green zone (50-100%) -->
+            <path d="M 50 10 A 40 40 0 0 1 90 50" fill="none" stroke="#22c55e" stroke-width="8" stroke-dasharray="62.83" stroke-dashoffset="0"/>
+            <!-- Needle -->
+            <line x1="50" y1="50" x2="50" y2="10" stroke="white" stroke-width="2" transform="rotate({{if .NeedlePct}}{{.NeedlePct}}{{else}}0{{end}} 50 50)" style="transform-origin: 50px 50px;"/>
+            <!-- Center dot -->
+            <circle cx="50" cy="50" r="3" fill="white"/>
+          </svg>
+        </div>
+      </div>
+      <div class="flex items-baseline mt-2 justify-center">
+        <span class="text-4xl font-semibold tracking-tight text-white font-mono">{{.DisplayValue}}</span>
+        {{if .Unit}}<span class="text-xs text-slate-500 ml-1.5 font-mono">{{.Unit}}</span>{{end}}
+      </div>
+    </div>
+    {{if .Snapshot.LabelValues}}
+    <div class="mt-3 flex flex-wrap gap-1">
+      {{range .Snapshot.LabelValues}}<span class="text-[10px] font-mono px-1.5 py-0.5 bg-slate-800 text-slate-400 rounded">{{.Name}}={{.Value}}</span>{{end}}
+    </div>
+  {{end}}
   {{else}}
-    <!-- counter / gauge: hardware-display value -->
+    <!-- counter: simple number display -->
     <div class="mt-4 flex items-baseline">
       <span class="text-4xl font-semibold tracking-tight text-white font-mono">{{.DisplayValue}}</span>
       {{if .Unit}}<span class="text-xs text-slate-500 ml-1.5 font-mono">{{.Unit}}</span>{{end}}

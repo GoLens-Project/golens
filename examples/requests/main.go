@@ -30,6 +30,11 @@ var endpoints = []string{
 	"/?fail=1",
 	"/order?sku=ABC",
 	"/order?sku=PRO",
+	"/connections",
+	"/size",
+	"/cpu",
+	"/latency",
+	"/conn-distribution",
 }
 
 func main() {

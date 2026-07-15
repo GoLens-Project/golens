@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"regexp"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,6 +44,8 @@ type Registry struct {
 	stopOnce sync.Once
 	started  atomic.Bool
 	debug    bool
+
+	GoroutineBaseline int // Baseline goroutine count when runtime metrics start
 }
 
 type sample struct {
@@ -114,7 +117,7 @@ func New(cfg Config) (*Registry, error) {
 }
 
 func (r *Registry) mustRegister(name string, t MetricType, desc string, labels []string, bounds []float64) {
-	m := newMetric(name, t, desc, labels, bounds)
+	m := newMetric(name, t, desc, labels, bounds, 0, 0)
 	r.mu.Lock()
 	r.metrics[name] = m
 	r.order = append(r.order, name)
@@ -122,7 +125,7 @@ func (r *Registry) mustRegister(name string, t MetricType, desc string, labels [
 }
 
 // Register declares a custom metric. Safe to call before Start.
-func (r *Registry) Register(name string, t MetricType, desc string, labels []string, bounds []float64) *Metric {
+func (r *Registry) Register(name string, t MetricType, desc string, labels []string, bounds []float64, gaugeMin, gaugeMax float64) *Metric {
 	r.mu.RLock()
 	if existing, ok := r.metrics[name]; ok {
 		r.mu.RUnlock()
@@ -130,7 +133,7 @@ func (r *Registry) Register(name string, t MetricType, desc string, labels []str
 	}
 	r.mu.RUnlock()
 
-	m := newMetric(name, t, desc, labels, bounds)
+	m := newMetric(name, t, desc, labels, bounds, gaugeMin, gaugeMax)
 	r.mu.Lock()
 	if len(r.metrics) >= r.cfg.MaxMetrics {
 		// Evict least-recently-used to bound cardinality.
@@ -196,7 +199,12 @@ func (r *Registry) Record(name string, value float64, labels ...Label) {
 func (r *Registry) Start(ctx context.Context) error {
 	r.ctx = ctx
 	if r.started.CompareAndSwap(false, true) {
+		// Capture baseline goroutine count before starting any background goroutines
+		r.GoroutineBaseline = runtime.NumGoroutine()
 		go r.loop()
+		if r.cfg.RuntimeMetrics.Enabled {
+			startRuntimeMetrics(ctx, r, r.cfg.RuntimeMetrics.Interval)
+		}
 	}
 	return nil
 }
@@ -249,7 +257,7 @@ func (r *Registry) process(s *sample) {
 		if len(r.metrics) >= r.cfg.MaxMetrics {
 			r.evictLocked()
 		}
-		m = newMetric(s.name, CounterType, "", nil, nil)
+		m = newMetric(s.name, CounterType, "", nil, nil, 0, 0)
 		r.metrics[s.name] = m
 		r.order = append(r.order, s.name)
 	}
@@ -257,7 +265,7 @@ func (r *Registry) process(s *sample) {
 
 	m.Record(s.value)
 	m.setLabels(s.labels) // last-seen label values for display (lock-free)
-	r.agg.add(s.name, s.value)
+	r.agg.add(s.name, s.value, m)
 
 	if r.debug {
 		log.Printf("[golens] recorded %s = %f", s.name, s.value)
@@ -353,6 +361,64 @@ func (r *Registry) Snapshot(name string) (MetricSnapshot, bool) {
 
 // Storage exposes the configured persistence backend for tests/extension.
 func (r *Registry) Storage() Storage { return r.storage }
+
+// HistoryPoint is a single point in a metric's time series.
+type HistoryPoint struct {
+	T                int64              `json:"t"`                // unix timestamp (seconds)
+	V                float64            `json:"v"`                // average value in this window
+	Min              float64            `json:"min"`             // minimum value in this window
+	Max              float64            `json:"max"`             // maximum value in this window
+	HistogramBuckets []HistogramBucket   `json:"histogram_buckets"` // histogram bucket counts (for histogram metrics only)
+}
+
+// HistorySeries is a time series for one metric.
+type HistorySeries struct {
+	Name            string         `json:"name"`
+	Points          []HistoryPoint `json:"points"`
+	HistogramBounds []float64      `json:"histogram_bounds"` // histogram bucket boundaries (for histogram metrics only)
+}
+
+// History queries storage for a metric's roll-up history over the given duration.
+func (r *Registry) History(name string, dur time.Duration) HistorySeries {
+	ctx := r.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	from := time.Now().Add(-dur)
+	q := Query{Name: name, From: from, To: time.Now()}
+	aggs, err := r.storage.Query(ctx, q)
+	if err != nil || len(aggs) == 0 {
+		return HistorySeries{Name: name}
+	}
+
+	// Get histogram bounds if this is a histogram metric
+	var histogramBounds []float64
+	r.mu.RLock()
+	if m, ok := r.metrics[name]; ok && m.Type == HistogramType {
+		histogramBounds = m.value.bounds
+	}
+	r.mu.RUnlock()
+
+	pts := make([]HistoryPoint, 0, len(aggs))
+	for _, a := range aggs {
+		avg := a.Sum / float64(a.Count)
+		if a.Count == 0 {
+			avg = 0
+		}
+		pts = append(pts, HistoryPoint{
+			T:                a.WindowEnd.Unix(),
+			V:                avg,
+			Min:              a.Min,
+			Max:              a.Max,
+			HistogramBuckets: a.HistogramBuckets,
+		})
+	}
+	return HistorySeries{
+		Name:            name,
+		Points:          pts,
+		HistogramBounds: histogramBounds,
+	}
+}
 
 // EndpointLatency returns per-endpoint latency snapshots (p50/p95/p99) for the
 // dashboard chart.

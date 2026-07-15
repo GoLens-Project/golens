@@ -11,9 +11,9 @@ func TestAggregatorTracksWindow(t *testing.T) {
 	storage := newMemoryStorage(0)
 	a := newAggregator(storage, time.Millisecond)
 
-	a.add("m", 2)
-	a.add("m", 4)
-	a.add("m", 6)
+	a.add("m", 2, nil)
+	a.add("m", 4, nil)
+	a.add("m", 6, nil)
 
 	// Peek into the window directly.
 	a.mu.Lock()
@@ -29,8 +29,8 @@ func TestAggregatorFlushAllWritesToStorage(t *testing.T) {
 	a := newAggregator(storage, time.Millisecond)
 	r := &Registry{storage: storage, ctx: context.Background(), cfg: DefaultConfig()}
 
-	a.add("flushed", 1)
-	a.add("flushed", 3)
+	a.add("flushed", 1, nil)
+	a.add("flushed", 3, nil)
 	a.flushAll(r)
 
 	res, err := storage.Query(context.Background(), Query{Name: "flushed"})
@@ -67,7 +67,7 @@ func TestAggregatorConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			a.add("c", 1)
+			a.add("c", 1, nil)
 		}()
 	}
 	wg.Wait()

@@ -61,6 +61,7 @@ const (
 func main() {
 	// Built-in auth OFF: the custom middleware below owns access control.
 	cfg := golens.DefaultConfig()
+	cfg.RuntimeMetrics.Enabled = true
 
 	registry, err := golens.New(cfg)
 	if err != nil {
@@ -97,6 +98,7 @@ func main() {
 		metrics.GET("", gin.WrapF(registry.DashboardHandler))
 		metrics.GET("/data", gin.WrapF(registry.DataHandler))
 		metrics.GET("/endpoints", gin.WrapH(registry.EndpointsHTTPHandler()))
+		metrics.GET("/history", gin.WrapH(registry.HistoryHTTPHandler()))
 	}
 
 	srv := &http.Server{Addr: ":8080", Handler: registry.Middleware(r)}
