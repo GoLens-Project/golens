@@ -81,13 +81,13 @@ func (a *aggregator) flushAll(r *Registry) {
 		}
 
 		agg := AggregatedMetric{
-			Name:            name,
-			Count:           w.count,
-			Sum:             w.sum,
-			Min:             w.min,
-			Max:             w.max,
-			WindowStart:     w.start,
-			WindowEnd:       now,
+			Name:             name,
+			Count:            w.count,
+			Sum:              w.sum,
+			Min:              w.min,
+			Max:              w.max,
+			WindowStart:      w.start,
+			WindowEnd:        now,
 			HistogramBuckets: histogramBuckets,
 		}
 		if err := r.storage.Store(ctx, agg); err != nil {

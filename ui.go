@@ -111,13 +111,13 @@ func (r *Registry) metricsPageHandler() http.Handler {
 			intervalMs = 5000
 		}
 		data := map[string]interface{}{
-			"PollMs":          intervalMs,
-			"PollSec":         intervalMs / 1000,
-			"Cards":           buildCards(r.Snapshots()),
-			"HookCards":       buildHookCards(r.Snapshots()),
-			"Interval":        r.cfg.UI.PollInterval.String(),
-			"RuntimeEnabled":  r.cfg.RuntimeMetrics.Enabled,
-			"ProjectName":     r.cfg.ProjectName,
+			"PollMs":         intervalMs,
+			"PollSec":        intervalMs / 1000,
+			"Cards":          buildCards(r.Snapshots()),
+			"HookCards":      buildHookCards(r.Snapshots()),
+			"Interval":       r.cfg.UI.PollInterval.String(),
+			"RuntimeEnabled": r.cfg.RuntimeMetrics.Enabled,
+			"ProjectName":    r.cfg.ProjectName,
 		}
 		// Render to a buffer first so a template error never produces a
 		// half-written response (which would force a superfluous WriteHeader).
@@ -232,9 +232,9 @@ type metricCard struct {
 	Bars         []histBar
 	HTTPColumns  []httpColumn // for HTTP request cards
 	// Gauge-specific fields
-	NeedlePct   int    // 0..100 needle position for gauges
-	MinValue    float64 // minimum value for gauge scale
-	MaxValue    float64 // maximum value for gauge scale
+	NeedlePct int     // 0..100 needle position for gauges
+	MinValue  float64 // minimum value for gauge scale
+	MaxValue  float64 // maximum value for gauge scale
 }
 
 type histBar struct {
@@ -244,11 +244,11 @@ type histBar struct {
 }
 
 type httpColumn struct {
-	Label       string // e.g., "2xx", "3xx", "4xx", "5xx", "total"
-	Value       float64
+	Label        string // e.g., "2xx", "3xx", "4xx", "5xx", "total"
+	Value        float64
 	DisplayValue string // formatted value
-	HeightPct   int    // 0..100 relative to total
-	ColorClass  string // tailwind color class
+	HeightPct    int    // 0..100 relative to total
+	ColorClass   string // tailwind color class
 }
 
 func buildCards(snaps []MetricSnapshot) []metricCard {
@@ -259,7 +259,7 @@ func buildCards(snaps []MetricSnapshot) []metricCard {
 		"go_memstats_heap_inuse_bytes": true,
 		"go_memstats_heap_objects":     true,
 		"cpu_usage_percent":            true,
-		"go_goroutines":                 true,
+		"go_goroutines":                true,
 	}
 
 	cards := make([]metricCard, 0, len(snaps))
@@ -302,10 +302,14 @@ func buildCards(snaps []MetricSnapshot) []metricCard {
 					maxVal = 1 // Ratio/rate metrics
 				} else if strings.Contains(lowerName, "bytes") || strings.Contains(lowerName, "mem") {
 					maxVal = s.Value * 2 // Memory metrics: 2x current value
-					if maxVal < 1024*1024 { maxVal = 1024*1024 } // Min 1MB
+					if maxVal < 1024*1024 {
+						maxVal = 1024 * 1024
+					} // Min 1MB
 				} else {
 					maxVal = s.Value * 1.5 // Default: 50% headroom
-					if maxVal < 10 { maxVal = 10 } // Minimum scale
+					if maxVal < 10 {
+						maxVal = 10
+					} // Minimum scale
 				}
 			}
 			if minVal == 0 && !strings.Contains(strings.ToLower(s.Name), "temp") {
@@ -379,10 +383,14 @@ func buildHookCards(snaps []MetricSnapshot) []metricCard {
 					maxVal = 1 // Ratio/rate metrics
 				} else if strings.Contains(lowerName, "bytes") || strings.Contains(lowerName, "mem") {
 					maxVal = s.Value * 2 // Memory metrics: 2x current value
-					if maxVal < 1024*1024 { maxVal = 1024*1024 } // Min 1MB
+					if maxVal < 1024*1024 {
+						maxVal = 1024 * 1024
+					} // Min 1MB
 				} else {
 					maxVal = s.Value * 1.5 // Default: 50% headroom
-					if maxVal < 10 { maxVal = 10 } // Minimum scale
+					if maxVal < 10 {
+						maxVal = 10
+					} // Minimum scale
 				}
 			}
 			if minVal == 0 && !strings.Contains(strings.ToLower(s.Name), "temp") {

@@ -13,15 +13,15 @@ type HistogramBucket struct {
 
 // AggregatedMetric is a roll-up bucket written to a persistence backend.
 type AggregatedMetric struct {
-	Name            string
-	Type            string
-	Labels          map[string]string
-	Count           int64
-	Sum             float64
-	Min             float64
-	Max             float64
-	WindowStart     time.Time
-	WindowEnd       time.Time
+	Name             string
+	Type             string
+	Labels           map[string]string
+	Count            int64
+	Sum              float64
+	Min              float64
+	Max              float64
+	WindowStart      time.Time
+	WindowEnd        time.Time
 	HistogramBuckets []HistogramBucket // Histogram bucket distributions (only for histogram types)
 }
 

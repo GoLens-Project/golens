@@ -421,10 +421,10 @@ func TestBuildCardsCounterGaugeHistogram(t *testing.T) {
 
 func TestBuildCardsGaugeAutoDetect(t *testing.T) {
 	tests := []struct {
-		name     string
-		snap     MetricSnapshot
-		wantMax  float64
-		wantPct  int
+		name    string
+		snap    MetricSnapshot
+		wantMax float64
+		wantPct int
 	}{
 		{
 			name:    "percent metric auto-detects max=100",

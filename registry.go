@@ -364,11 +364,11 @@ func (r *Registry) Storage() Storage { return r.storage }
 
 // HistoryPoint is a single point in a metric's time series.
 type HistoryPoint struct {
-	T                int64              `json:"t"`                // unix timestamp (seconds)
-	V                float64            `json:"v"`                // average value in this window
-	Min              float64            `json:"min"`             // minimum value in this window
-	Max              float64            `json:"max"`             // maximum value in this window
-	HistogramBuckets []HistogramBucket   `json:"histogram_buckets"` // histogram bucket counts (for histogram metrics only)
+	T                int64             `json:"t"`                 // unix timestamp (seconds)
+	V                float64           `json:"v"`                 // average value in this window
+	Min              float64           `json:"min"`               // minimum value in this window
+	Max              float64           `json:"max"`               // maximum value in this window
+	HistogramBuckets []HistogramBucket `json:"histogram_buckets"` // histogram bucket counts (for histogram metrics only)
 }
 
 // HistorySeries is a time series for one metric.
