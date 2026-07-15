@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS metrics (
     max REAL NOT NULL DEFAULT 0,
     window_start INTEGER NOT NULL,
     window_end INTEGER NOT NULL,
+    histogram_buckets TEXT,
     created_at INTEGER DEFAULT (strftime('%s','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_metrics_name ON metrics(name);
@@ -46,23 +47,29 @@ func newSQLiteStorage(path string) (*sqliteStorage, error) {
 		db.Close()
 		return nil, fmt.Errorf("golens: init sqlite schema: %w", err)
 	}
+
+	// Migration: Add histogram_buckets column if it doesn't exist (for existing databases).
+	// SQLite returns an error for duplicate ADD COLUMN — that's expected and safe to ignore.
+	_, _ = db.Exec(`ALTER TABLE metrics ADD COLUMN histogram_buckets TEXT`)
+
 	return &sqliteStorage{db: db}, nil
 }
 
 func (s *sqliteStorage) Store(ctx context.Context, m AggregatedMetric) error {
 	labels, _ := json.Marshal(m.Labels)
+	histogramBuckets, _ := json.Marshal(m.HistogramBuckets)
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO metrics (name, type, labels, count, sum, min, max, window_start, window_end)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO metrics (name, type, labels, count, sum, min, max, window_start, window_end, histogram_buckets)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		m.Name, m.Type, string(labels), m.Count, m.Sum, m.Min, m.Max,
-		m.WindowStart.Unix(), m.WindowEnd.Unix(),
+		m.WindowStart.Unix(), m.WindowEnd.Unix(), string(histogramBuckets),
 	)
 	return err
 }
 
 func (s *sqliteStorage) Query(ctx context.Context, q Query) ([]AggregatedMetric, error) {
-	query := `SELECT name, type, labels, count, sum, min, max, window_start, window_end FROM metrics WHERE 1=1`
-	args := []interface{}{}
+	query := `SELECT name, type, labels, count, sum, min, max, window_start, window_end, histogram_buckets FROM metrics WHERE 1=1`
+	args := []any{}
 	if q.Name != "" {
 		query += ` AND name = ?`
 		args = append(args, q.Name)
@@ -90,11 +97,13 @@ func (s *sqliteStorage) Query(ctx context.Context, q Query) ([]AggregatedMetric,
 	for rows.Next() {
 		var m AggregatedMetric
 		var labelsJSON string
+		var histogramBucketsJSON string
 		var ws, we int64
-		if err := rows.Scan(&m.Name, &m.Type, &labelsJSON, &m.Count, &m.Sum, &m.Min, &m.Max, &ws, &we); err != nil {
+		if err := rows.Scan(&m.Name, &m.Type, &labelsJSON, &m.Count, &m.Sum, &m.Min, &m.Max, &ws, &we, &histogramBucketsJSON); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(labelsJSON), &m.Labels)
+		_ = json.Unmarshal([]byte(histogramBucketsJSON), &m.HistogramBuckets)
 		m.WindowStart = time.Unix(ws, 0)
 		m.WindowEnd = time.Unix(we, 0)
 		out = append(out, m)

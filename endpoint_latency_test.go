@@ -144,3 +144,17 @@ func TestEndpointsHTTPHandler(t *testing.T) {
 		t.Errorf("endpoint missing in response: %s", body)
 	}
 }
+
+func TestEndpointTrackerReset(t *testing.T) {
+	tr := newEndpointTracker(64)
+	tr.Observe("GET", "/a", 0.01)
+	tr.Observe("POST", "/b", 0.02)
+	if len(tr.Snapshots()) != 2 {
+		t.Fatalf("pre-reset: want 2 endpoints, got %d", len(tr.Snapshots()))
+	}
+
+	tr.Reset()
+	if len(tr.Snapshots()) != 0 {
+		t.Errorf("post-reset: want 0 endpoints, got %d", len(tr.Snapshots()))
+	}
+}

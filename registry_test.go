@@ -68,8 +68,8 @@ func TestRegistryRecordAutoCreatesUnknownMetric(t *testing.T) {
 
 func TestRegistryRegisterReturnsExisting(t *testing.T) {
 	r := newTestRegistry(t, DefaultConfig())
-	m1 := r.Register("dup", CounterType, "first", nil, nil)
-	m2 := r.Register("dup", GaugeType, "second", nil, nil)
+	m1 := r.Register("dup", CounterType, "first", nil, nil, 0, 0)
+	m2 := r.Register("dup", GaugeType, "second", nil, nil, 0, 0)
 	if m1 != m2 {
 		t.Error("Register should return the existing metric on duplicate name")
 	}
@@ -83,10 +83,10 @@ func TestRegistryEvictionRespectsMax(t *testing.T) {
 	cfg.MaxMetrics = 2
 	r := newTestRegistry(t, cfg)
 
-	r.Register("a", CounterType, "", nil, nil)
-	r.Register("b", CounterType, "", nil, nil)
+	r.Register("a", CounterType, "", nil, nil, 0, 0)
+	r.Register("b", CounterType, "", nil, nil, 0, 0)
 	// exceeds cap -> eviction of idle metric (a, never recorded)
-	r.Register("c", CounterType, "", nil, nil)
+	r.Register("c", CounterType, "", nil, nil, 0, 0)
 
 	if _, ok := r.Snapshot("a"); ok {
 		_ = ok // a may or may not be evicted depending on idle logic; c must exist
@@ -102,13 +102,13 @@ func TestRegistryEvictionWithIdleTTL(t *testing.T) {
 	cfg.MetricTTL = 1 * time.Nanosecond
 	r := newTestRegistry(t, cfg)
 
-	old := r.Register("old_metric", CounterType, "", nil, nil)
+	old := r.Register("old_metric", CounterType, "", nil, nil, 0, 0)
 	old.Record(1)
 	time.Sleep(2 * time.Millisecond)
 	// forcing TTL: set last into the past
 	old.value.last.Store(1)
 
-	r.Register("new_metric", CounterType, "", nil, nil)
+	r.Register("new_metric", CounterType, "", nil, nil, 0, 0)
 	if _, ok := r.Snapshot("new_metric"); !ok {
 		t.Error("new metric should exist after idle eviction")
 	}
@@ -173,8 +173,8 @@ func TestRegistryNonBlockingUnderSaturation(t *testing.T) {
 
 func TestRegistrySnapshotsOrder(t *testing.T) {
 	r := newTestRegistry(t, DefaultConfig())
-	r.Register("z", CounterType, "", nil, nil)
-	r.Register("a", CounterType, "", nil, nil)
+	r.Register("z", CounterType, "", nil, nil, 0, 0)
+	r.Register("a", CounterType, "", nil, nil, 0, 0)
 	snaps := r.Snapshots()
 	// RED metrics first, then z, then a (insertion order)
 	found := []string{}
@@ -218,5 +218,71 @@ func waitForDrain(r *Registry) {
 			return
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestHistoryWithData(t *testing.T) {
+	r := newTestRegistry(t, DefaultConfig())
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	defer func() { cancel(); r.Close() }()
+
+	r.Record("history_metric", 10)
+	r.Record("history_metric", 20)
+	waitForDrain(r)
+
+	// Wait for at least one flush cycle (FlushInterval is 5ms in tests)
+	time.Sleep(20 * time.Millisecond)
+
+	series := r.History("history_metric", time.Hour)
+	if series.Name != "history_metric" {
+		t.Errorf("series name = %q, want history_metric", series.Name)
+	}
+	if len(series.Points) == 0 {
+		t.Error("History returned no points after flush")
+	}
+}
+
+func TestHistoryNoData(t *testing.T) {
+	r := newTestRegistry(t, DefaultConfig())
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	defer func() { cancel(); r.Close() }()
+
+	series := r.History("nonexistent", time.Hour)
+	if series.Name != "nonexistent" {
+		t.Errorf("series name = %q, want nonexistent", series.Name)
+	}
+	if len(series.Points) != 0 {
+		t.Errorf("expected 0 points, got %d", len(series.Points))
+	}
+}
+
+func TestHistoryNilContext(t *testing.T) {
+	r := newTestRegistry(t, DefaultConfig())
+	// Don't start — ctx is nil, History should fall back to context.Background()
+
+	series := r.History("anything", time.Hour)
+	if series.Name != "anything" {
+		t.Errorf("series name = %q", series.Name)
+	}
+}
+
+func TestHistoryHistogramBounds(t *testing.T) {
+	r := newTestRegistry(t, DefaultConfig())
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	defer func() { cancel(); r.Close() }()
+
+	bounds := []float64{1, 5, 10}
+	r.Register("hist_metric", HistogramType, "test histogram", nil, bounds, 0, 0)
+	r.Record("hist_metric", 3)
+	r.Record("hist_metric", 7)
+	waitForDrain(r)
+	time.Sleep(20 * time.Millisecond)
+
+	series := r.History("hist_metric", time.Hour)
+	if len(series.HistogramBounds) != len(bounds) {
+		t.Errorf("histogram bounds len = %d, want %d", len(series.HistogramBounds), len(bounds))
 	}
 }

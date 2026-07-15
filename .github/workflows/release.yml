@@ -28,13 +28,13 @@ jobs:
           for label in $LABELS; do
             case "$label" in
               major) BUMP="major"; break ;;
-              minor) BUMP="minor" ;;
-              patch) [ -z "$BUMP" ] && BUMP="patch" ;;
+              feat)  BUMP="minor" ;;
+              fix)   [ -z "$BUMP" ] && BUMP="patch" ;;
             esac
           done
 
           if [ -z "$BUMP" ]; then
-            echo "::error::No version label (major/minor/patch) found on PR. Add one before merging."
+            echo "::error::No version label (fix/feat/major) found on PR. Add one before merging."
             exit 1
           fi
 

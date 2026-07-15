@@ -4,11 +4,11 @@ all: build test
 
 ## build: compile all packages (binaries go to /dev/null — no artifacts left behind)
 build:
-	go build .
+	go build -o /dev/null .
 	go build -o /dev/null ./examples/api/stdlibmux
 	go build -o /dev/null ./examples/api/gin
-	go build -o /dev/null ./examples/api/authed-gin
-	go build -o /dev/null ./examples/api/api-auth-gin
+	go build -o /dev/null ./examples/api/basic-authed-gin
+	go build -o /dev/null ./examples/api/token-authed-gin
 	go build -o /dev/null ./examples/requests
 
 ## test: run the unit tests
@@ -19,14 +19,14 @@ test:
 test-race:
 	go test -race -count=1 -timeout 180s ./...
 
-## cover: run tests and print a coverage summary
+## cover: run tests and print a coverage summary (examples excluded)
 cover:
-	go test -count=1 -timeout 120s -coverprofile=coverage.out ./...
+	go test -count=1 -timeout 120s -coverprofile=coverage.out $$(go list ./... | grep -v /examples/)
 	go tool cover -func=coverage.out | tail -1
 
-## cover-ci: coverage run matching CI (race detector + atomic mode)
+## cover-ci: coverage run matching CI (race detector + atomic mode, examples excluded)
 cover-ci:
-	go test -race -count=1 -timeout 120s -coverprofile=coverage.out -covermode=atomic ./...
+	go test -race -count=1 -timeout 120s -coverprofile=coverage.out -covermode=atomic $$(go list ./... | grep -v /examples/)
 	go tool cover -func=coverage.out | tail -1
 
 ## vet: run go vet
@@ -51,15 +51,15 @@ tidy-check:
 	go mod tidy
 	@git diff --exit-code go.mod go.sum || (echo "go.mod/go.sum not tidy — run 'make tidy' and commit" && exit 1)
 
-## ci: run the full CI pipeline locally (build → vet → tidy-check → race tests)
-ci: build vet tidy-check test-race
+## ci: run the full CI pipeline locally (build → vet → tidy-check → lint → race tests)
+ci: build vet tidy-check lint test-race
 
 ## example: build all example servers
 example:
 	go build -o bin/stdlibmux ./examples/api/stdlibmux
 	go build -o bin/gin ./examples/api/gin
-	go build -o bin/authed-gin ./examples/api/authed-gin
-	go build -o bin/api-auth-gin ./examples/api/api-auth-gin
+	go build -o bin/basic-authed-gin ./examples/api/basic-authed-gin
+	go build -o bin/token-authed-gin ./examples/api/token-authed-gin
 
 ## run-stdlib: build and run the stdlib mux example
 run-stdlib: example
@@ -69,13 +69,13 @@ run-stdlib: example
 run-gin: example
 	./bin/gin
 
-## run-authed-gin: build and run the basic-auth gin example
-run-authed-gin: example
-	./bin/authed-gin
+## run-basic-authed-gin: build and run the basic-auth gin example
+run-basic-authed-gin: example
+	./bin/basic-authed-gin
 
-## run-api-auth-gin: build and run the api-token gin example
-run-api-auth-gin: example
-	./bin/api-auth-gin
+## run-token-authed-gin: build and run the api-token gin example
+run-token-authed-gin: example
+	./bin/token-authed-gin
 
 ## clean: remove build artifacts
 clean:

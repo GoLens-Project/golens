@@ -57,6 +57,8 @@ type Metric struct {
 	Description string
 	Labels      []string
 	value       metricValue
+	gaugeMin    float64 // minimum value for gauge scale (0 = auto)
+	gaugeMax    float64 // maximum value for gauge scale (0 = auto)
 }
 
 // metricValue is the concurrent-safe numeric payload. Counters and gauges use
@@ -78,12 +80,14 @@ type metricValue struct {
 const scaleFactor = 1_000_000 // 6 decimal places of precision in fixed-point
 
 // newMetric allocates a metric with the right value structure for its type.
-func newMetric(name string, mtype MetricType, desc string, labels []string, bounds []float64) *Metric {
+func newMetric(name string, mtype MetricType, desc string, labels []string, bounds []float64, gaugeMin, gaugeMax float64) *Metric {
 	m := &Metric{
 		Name:        name,
 		Type:        mtype,
 		Description: desc,
 		Labels:      labels,
+		gaugeMin:    gaugeMin,
+		gaugeMax:    gaugeMax,
 	}
 	if mtype == HistogramType {
 		if len(bounds) == 0 {
@@ -171,6 +175,8 @@ func (m *Metric) Snapshot() MetricSnapshot {
 		}
 		s.Buckets = m.histogramBuckets()
 	}
+	s.GaugeMin = m.gaugeMin
+	s.GaugeMax = m.gaugeMax
 	return s
 }
 
@@ -203,6 +209,8 @@ type MetricSnapshot struct {
 	Avg         float64
 	Buckets     []BucketSnapshot
 	UpdatedAt   int64
+	GaugeMin    float64 // minimum value for gauge scale
+	GaugeMax    float64 // maximum value for gauge scale
 }
 
 // BucketSnapshot is one histogram bucket.

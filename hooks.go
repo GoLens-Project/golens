@@ -27,7 +27,9 @@ type HookBuilder struct {
 	desc     string
 	labels   []string
 	extract  ExtractFunc
-	bounds   []float64
+	bounds   []float64 // histogram bounds
+	gaugeMax float64   // gauge maximum value (0 = auto)
+	gaugeMin float64   // gauge minimum value (default 0)
 }
 
 // ExtractFunc returns the value to record and any labels for a given request.
@@ -66,11 +68,23 @@ func (h *HookBuilder) Bounds(b ...float64) *HookBuilder {
 	return h
 }
 
+// Max sets the maximum value for gauges (0 = auto-scale).
+func (h *HookBuilder) Max(max float64) *HookBuilder {
+	h.gaugeMax = max
+	return h
+}
+
+// Min sets the minimum value for gauges (default 0).
+func (h *HookBuilder) Min(min float64) *HookBuilder {
+	h.gaugeMin = min
+	return h
+}
+
 // Extract attaches the value extraction function and finalizes registration,
 // returning an http.Handler middleware that records the metric when applied.
 func (h *HookBuilder) Extract(fn ExtractFunc) func(http.Handler) http.Handler {
 	h.extract = fn
-	h.registry.Register(h.name, h.mtype, h.desc, h.labels, h.bounds)
+	h.registry.Register(h.name, h.mtype, h.desc, h.labels, h.bounds, h.gaugeMin, h.gaugeMax)
 	name := h.name
 	registry := h.registry
 	return func(next http.Handler) http.Handler {

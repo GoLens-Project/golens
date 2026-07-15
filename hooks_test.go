@@ -121,3 +121,31 @@ func TestErrorRateMiddleware(t *testing.T) {
 		t.Errorf("errors = %v, want 1", s.Value)
 	}
 }
+
+func TestHookBuilderMinMax(t *testing.T) {
+	r, cleanup := startTestRegistry(t)
+	defer cleanup()
+
+	mw := r.On("gauge_metric").
+		Type(GaugeType).
+		Min(10).
+		Max(90).
+		Extract(func(req *http.Request) (float64, []Label) {
+			return 50, nil
+		})
+
+	h := mw(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) { w.WriteHeader(200) }))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/x", nil))
+	waitForDrain(r)
+
+	s, ok := r.Snapshot("gauge_metric")
+	if !ok {
+		t.Fatal("gauge_metric not registered")
+	}
+	if s.GaugeMin != 10 {
+		t.Errorf("GaugeMin = %v, want 10", s.GaugeMin)
+	}
+	if s.GaugeMax != 90 {
+		t.Errorf("GaugeMax = %v, want 90", s.GaugeMax)
+	}
+}

@@ -6,6 +6,11 @@
 // with the GoLens middleware and feed the result back to a net/http.Server.
 // This keeps the full RED pipeline (count, errors, latency) working without a
 // Gin-specific adapter.
+//
+// This example also demonstrates histogram time-series visualization:
+// - Call /conn-distribution to generate histogram data
+// - View "Histogram Time-Series" section in the dashboard to see bucket distribution evolution
+// - Select different time ranges (5m, 30m, 1h, etc.) to analyze distribution trends
 package main
 
 import (
@@ -24,7 +29,8 @@ import (
 
 func main() {
 	cfg := golens.DefaultConfig()
-	cfg.Debug = os.Getenv("GOLENS_DEBUG") == "true"
+	cfg.Debug = true
+	cfg.RuntimeMetrics.Enabled = true
 	if path := os.Getenv("GOLENS_CONFIG"); path != "" {
 		if loaded, err := golens.LoadConfig(path); err == nil {
 			cfg = loaded
@@ -47,7 +53,7 @@ func main() {
 	// Custom domain metric via the fluent hook API. The returned middleware is
 	// a standard http.Handler wrapper; we mount it on the Gin route by handing
 	// the request off to a small http.HandlerFunc that calls back into Gin.
-	orderHook := registry.On("orders_created").
+	orderTracker := registry.On("orders_created").
 		Type(golens.CounterType).
 		Description("orders created").
 		Labels("sku").
@@ -63,6 +69,7 @@ func main() {
 	mountHTTPHandler(r, "/metrics", registry.MetricsHTTPHandler())
 	mountHTTPHandler(r, "/metrics/data", registry.MetricsDataHTTPHandler())
 	mountHTTPHandler(r, "/metrics/endpoints", registry.EndpointsHTTPHandler())
+	mountHTTPHandler(r, "/metrics/history", registry.HistoryHTTPHandler())
 
 	r.GET("/", func(c *gin.Context) {
 		time.Sleep(5 * time.Millisecond) // simulate work
@@ -73,11 +80,146 @@ func main() {
 		c.String(http.StatusOK, "hello from gin\n")
 	})
 
-	// Apply the fluent-hook middleware to a single route. orderHook returns a
+	// Apply the fluent-hook middleware to a single route. orderTracker returns a
 	// standard func(http.Handler) http.Handler; wrap the final handler with
 	// http.HandlerFunc and adapt the result for Gin with gin.WrapH.
-	r.GET("/order", gin.WrapH(orderHook(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+	r.GET("/order", gin.WrapH(orderTracker(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusCreated)
+	}))))
+
+	// Custom gauge metric for CPU usage percentage (demonstrates semi-circle gauge).
+	cpuUsage := registry.On("cpu_usage_percent").
+		Type(golens.GaugeType).
+		Description("current CPU usage percentage").
+		Labels("source").
+		Min(0).   // CPU percentage: 0-100%
+		Max(100). // CPU percentage: 0-100%
+		Extract(func(req *http.Request) (float64, []golens.Label) {
+			// Simulate varying CPU usage for demo
+			usage := 30.0 + float64((len(req.URL.Path)*7)%60) // 30-90% range
+			return usage, []golens.Label{{Name: "source", Value: "app"}}
+		})
+	r.GET("/cpu", gin.WrapH(cpuUsage(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("CPU usage tracked\n"))
+	}))))
+
+	// Custom gauge metric for tracking active connections.
+	activeConnections := registry.On("active_connections").
+		Type(golens.GaugeType).
+		Description("currently active connections").
+		Labels("endpoint").
+		Min(0).  // Minimum 0 connections
+		Max(50). // Maximum 50 connections for demo
+		Extract(func(req *http.Request) (float64, []golens.Label) {
+			endpoint := req.URL.Path
+			if endpoint == "" {
+				endpoint = "/"
+			}
+			// In a real app, you'd track actual connection count
+			// For demo, we return varied mock values to show gauge changes
+			connCount := 5.0 + float64(len(endpoint)%10) // Vary by endpoint
+			switch endpoint {
+			case "/order":
+				connCount = 12.0
+			case "/connections":
+				connCount = 8.0
+			case "/size":
+				connCount = 3.0
+			}
+			return connCount, []golens.Label{{Name: "endpoint", Value: endpoint}}
+		})
+	r.GET("/connections", gin.WrapH(activeConnections(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("active connections tracked\n"))
+	}))))
+
+	// Custom histogram metric for tracking active connections distribution.
+	// This shows the SAME data as the gauge but as distribution bars AND time-series.
+	activeConnHist := registry.On("active_connections_distribution").
+		Type(golens.HistogramType).
+		Description("active connections distribution over time").
+		Labels("endpoint").
+		Bounds(1, 5, 10, 20, 35, 50). // Connection count buckets
+		Extract(func(req *http.Request) (float64, []golens.Label) {
+			// Track the SAME values as the gauge for demonstration
+			endpoint := req.URL.Path
+			if endpoint == "" {
+				endpoint = "/"
+			}
+			connCount := 5.0 + float64(len(endpoint)%10) // Vary by endpoint
+			switch endpoint {
+			case "/order":
+				connCount = 12.0
+			case "/connections":
+				connCount = 8.0
+			case "/size":
+				connCount = 3.0
+			}
+			return connCount, []golens.Label{{Name: "endpoint", Value: endpoint}}
+		})
+	r.GET("/conn-distribution", gin.WrapH(activeConnHist(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("connection distribution tracked\n"))
+	}))))
+
+	// Custom histogram metric for request processing time.
+	requestDuration := registry.On("request_processing_time_ms").
+		Type(golens.HistogramType).
+		Description("request processing time in milliseconds").
+		Labels("endpoint").
+		Bounds(10, 25, 50, 100, 250, 500, 1000). // Millisecond buckets
+		Extract(func(req *http.Request) (float64, []golens.Label) {
+			// Simulate varying request processing times
+			endpoint := req.URL.Path
+			if endpoint == "" {
+				endpoint = "/"
+			}
+			// Different endpoints have different processing times
+			duration := 50.0 + float64((len(endpoint)*17)%150) // 50-200ms range
+			switch endpoint {
+			case "/order":
+				duration = 120.0
+			case "/connections":
+				duration = 80.0
+			case "/size":
+				duration = 200.0
+			case "/cpu":
+				duration = 150.0
+			}
+			return duration, []golens.Label{{Name: "endpoint", Value: endpoint}}
+		})
+	r.GET("/latency", gin.WrapH(requestDuration(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("request processing time tracked\n"))
+	}))))
+
+	// Custom histogram metric for tracking response sizes with appropriate bounds.
+	responseSizeHist := registry.On("response_size_bytes").
+		Type(golens.HistogramType).
+		Description("response size in bytes").
+		Labels("endpoint").
+		Bounds(128, 256, 512, 1024, 2048, 4096, 8192). // Byte-sized buckets
+		Extract(func(req *http.Request) (float64, []golens.Label) {
+			endpoint := req.URL.Path
+			if endpoint == "" {
+				endpoint = "/"
+			}
+			// Simulate different response sizes for demo
+			size := 1024.0 + float64((len(endpoint)*128)%1024) // Varied sizes
+			switch endpoint {
+			case "/order":
+				size = 512.0
+			case "/connections":
+				size = 256.0
+			case "/size":
+				size = 2048.0
+			}
+			return size, []golens.Label{{Name: "endpoint", Value: endpoint}}
+		})
+	r.GET("/size", gin.WrapH(responseSizeHist(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("response size tracked\n"))
 	}))))
 
 	// Wrap the whole Gin engine with the GoLens RED middleware. This is the

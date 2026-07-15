@@ -18,13 +18,13 @@ jobs:
       - name: Check for version label
         run: |
           LABELS=$(gh pr view ${{ github.event.pull_request.number }} --json labels --jq '.labels[].name')
-          for label in major minor patch; do
+          for label in fix feat major; do
             if echo "$LABELS" | grep -qx "$label"; then
               echo "Found version label: $label"
               exit 0
             fi
           done
-          echo "::error::No version label (major/minor/patch) on this PR. A maintainer must add one before merging."
+          echo "::error::No version label (fix/feat/major) on this PR. A maintainer must add one before merging."
           exit 1
         env:
           GH_TOKEN: ${{ github.token }}
@@ -56,11 +56,11 @@ jobs:
 
       - name: Build
         run: |
-          go build .
+          go build -o /dev/null .
           go build -o /dev/null ./examples/api/stdlibmux
           go build -o /dev/null ./examples/api/gin
-          go build -o /dev/null ./examples/api/authed-gin
-          go build -o /dev/null ./examples/api/api-auth-gin
+          go build -o /dev/null ./examples/api/basic-authed-gin
+          go build -o /dev/null ./examples/api/token-authed-gin
           go build -o /dev/null ./examples/requests
 
       - name: Vet
@@ -68,7 +68,7 @@ jobs:
 
       - name: Test with coverage
         run: |
-          go test -race -count=1 -timeout 120s -coverprofile=coverage.out -covermode=atomic ./...
+          go test -race -count=1 -timeout 120s -coverprofile=coverage.out -covermode=atomic $(go list ./... | grep -v /examples/)
           go tool cover -func=coverage.out | tail -1
 
       - name: Upload coverage
@@ -92,7 +92,6 @@ jobs:
           cache: true
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v7
         with:
-          version: latest
-          args: --timeout=5m
+          version: v2.12.2

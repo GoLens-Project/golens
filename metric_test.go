@@ -39,7 +39,7 @@ func TestMetricTypeChart(t *testing.T) {
 }
 
 func TestCounterRecordAndSnapshot(t *testing.T) {
-	m := newMetric("requests", CounterType, "reqs", nil, nil)
+	m := newMetric("requests", CounterType, "reqs", nil, nil, 0, 0)
 	m.Record(5)
 	m.Record(7)
 	s := m.Snapshot()
@@ -55,7 +55,7 @@ func TestCounterRecordAndSnapshot(t *testing.T) {
 }
 
 func TestGaugeRecordReplaces(t *testing.T) {
-	m := newMetric("temp", GaugeType, "", nil, nil)
+	m := newMetric("temp", GaugeType, "", nil, nil, 0, 100)
 	m.Record(10)
 	m.Record(20)
 	m.Record(15)
@@ -66,7 +66,7 @@ func TestGaugeRecordReplaces(t *testing.T) {
 
 func TestHistogramBuckets(t *testing.T) {
 	bounds := []float64{1, 5, 10}
-	m := newMetric("lat", HistogramType, "", nil, bounds)
+	m := newMetric("lat", HistogramType, "", nil, bounds, 0, 0)
 	for _, v := range []float64{0.5, 0.5, 3, 7, 100} {
 		m.Record(v)
 	}
@@ -97,7 +97,7 @@ func TestHistogramBuckets(t *testing.T) {
 }
 
 func TestHistogramDefaultBounds(t *testing.T) {
-	m := newMetric("h", HistogramType, "", nil, nil)
+	m := newMetric("h", HistogramType, "", nil, nil, 0, 0)
 	m.Record(0.1)
 	s := m.Snapshot()
 	if len(s.Buckets) != len(DefaultHistogramBounds)+1 {
@@ -106,7 +106,7 @@ func TestHistogramDefaultBounds(t *testing.T) {
 }
 
 func TestHistogramZeroCount(t *testing.T) {
-	m := newMetric("h", HistogramType, "", nil, []float64{1})
+	m := newMetric("h", HistogramType, "", nil, []float64{1}, 0, 0)
 	s := m.Snapshot()
 	if s.Count != 0 || s.Avg != 0 {
 		t.Errorf("empty histogram snapshot = %+v", s)
