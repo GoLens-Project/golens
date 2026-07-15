@@ -51,8 +51,8 @@ tidy-check:
 	go mod tidy
 	@git diff --exit-code go.mod go.sum || (echo "go.mod/go.sum not tidy — run 'make tidy' and commit" && exit 1)
 
-## ci: run the full CI pipeline locally (build → vet → tidy-check → race tests)
-ci: build vet tidy-check test-race
+## ci: run the full CI pipeline locally (build → vet → tidy-check → lint → race tests)
+ci: build vet tidy-check lint test-race
 
 ## example: build all example servers
 example:
