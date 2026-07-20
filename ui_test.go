@@ -722,3 +722,119 @@ func TestHooksHandlerHTML(t *testing.T) {
 		t.Errorf("content-type = %q, want text/html", ct)
 	}
 }
+
+// --- Cardinality endpoint tests ---
+
+func TestCardinalityEndpointJSON(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxLabelSeriesPerMetric = 10
+	r := newTestRegistry(t, cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	defer func() { cancel(); r.Close() }()
+
+	// Generate some cardinality data
+	r.Record("test_metric", 1, Label{Name: "k", Value: "a"})
+	r.Record("test_metric", 2, Label{Name: "k", Value: "b"})
+	waitForDrain(r)
+
+	mux := http.NewServeMux()
+	r.MountUI(mux)
+
+	req := httptest.NewRequest("GET", "/metrics/cardinality", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("content-type = %q, want application/json", ct)
+	}
+	var snaps []CardinalitySnapshot
+	if err := json.Unmarshal(rec.Body.Bytes(), &snaps); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	found := false
+	for _, s := range snaps {
+		if s.MetricName == "test_metric" {
+			found = true
+			if s.Series != 2 {
+				t.Errorf("series = %d, want 2", s.Series)
+			}
+			if s.MaxSeries != 10 {
+				t.Errorf("max = %d, want 10", s.MaxSeries)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("test_metric not in cardinality snapshots: %+v", snaps)
+	}
+}
+
+func TestCardinalityEndpointDisabledUI(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.UI.Enabled = false
+	r := newTestRegistry(t, cfg)
+
+	h := r.CardinalityHTTPHandler()
+	if h != nil {
+		t.Error("expected nil handler when UI disabled")
+	}
+}
+
+func TestDashboardContainsInternalsSection(t *testing.T) {
+	r := newTestRegistry(t, DefaultConfig())
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	defer func() { cancel(); r.Close() }()
+
+	mux := http.NewServeMux()
+	r.MountUI(mux)
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "GoLens Internals") {
+		t.Error("dashboard missing GoLens Internals section")
+	}
+	if !strings.Contains(body, "cardinalityPanel") {
+		t.Error("dashboard missing cardinalityPanel Alpine function")
+	}
+	if !strings.Contains(body, "/metrics/cardinality") {
+		t.Error("dashboard missing cardinality endpoint reference")
+	}
+	if !strings.Contains(body, "Per-Metric Cardinality") {
+		t.Error("dashboard missing per-metric cardinality table")
+	}
+}
+
+func TestCardinalityEndpointNoData(t *testing.T) {
+	r := newTestRegistry(t, DefaultConfig())
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	defer func() { cancel(); r.Close() }()
+
+	mux := http.NewServeMux()
+	r.MountUI(mux)
+
+	req := httptest.NewRequest("GET", "/metrics/cardinality", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+	// Should return empty array, not null
+	if rec.Body.String() != "[]\n" && rec.Body.String() != "null\n" {
+		// Either empty array or null is acceptable
+		var snaps []CardinalitySnapshot
+		if err := json.Unmarshal(rec.Body.Bytes(), &snaps); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if len(snaps) != 0 {
+			t.Errorf("expected empty, got %d entries", len(snaps))
+		}
+	}
+}

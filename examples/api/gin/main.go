@@ -69,6 +69,7 @@ func main() {
 	mountHTTPHandler(r, "/metrics", registry.MetricsHTTPHandler())
 	mountHTTPHandler(r, "/metrics/data", registry.MetricsDataHTTPHandler())
 	mountHTTPHandler(r, "/metrics/endpoints", registry.EndpointsHTTPHandler())
+	mountHTTPHandler(r, "/metrics/cardinality", registry.CardinalityHTTPHandler())
 	mountHTTPHandler(r, "/metrics/history", registry.HistoryHTTPHandler())
 
 	r.GET("/", func(c *gin.Context) {
@@ -220,6 +221,32 @@ func main() {
 	r.GET("/size", gin.WrapH(responseSizeHist(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("response size tracked\n"))
+	}))))
+
+	// Demonstrate cardinality-aware labels: this counter tracks requests by
+	// "tenant" — a label that could grow unbounded in a multi-tenant system.
+	// GoLens's cardinality guard (configured via max_label_series_per_metric)
+	// will automatically drop new tenant label combinations once the cap is
+	// hit, preventing unbounded series growth. Check the "GoLens Internals"
+	// section on the dashboard to see series counts and dropped samples.
+	tenantRequests := registry.On("tenant_requests_total").
+		Type(golens.CounterType).
+		Description("requests per tenant (cardinality-bounded)").
+		Labels("tenant").
+		Extract(func(req *http.Request) (float64, []golens.Label) {
+			tenant := req.URL.Query().Get("tenant")
+			if tenant == "" {
+				tenant = "default"
+			}
+			return 1, []golens.Label{{Name: "tenant", Value: tenant}}
+		})
+	r.GET("/tenant", gin.WrapH(tenantRequests(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		tenant := req.URL.Query().Get("tenant")
+		if tenant == "" {
+			tenant = "default"
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("tenant request tracked: " + tenant + "\n"))
 	}))))
 
 	// Wrap the whole Gin engine with the GoLens RED middleware. This is the

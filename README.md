@@ -1,4 +1,10 @@
-# Project Specification: GoLens
+# GoLens
+
+[![CI](https://github.com/GoLens-Project/golens/actions/workflows/ci.yml/badge.svg)](https://github.com/GoLens-Project/golens/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/GoLens-Project/golens.svg)](https://pkg.go.dev/github.com/GoLens-Project/golens)
+[![Coverage](https://img.shields.io/badge/coverage-94%25-brightgreen)](https://github.com/GoLens-Project/golens/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Go Version](https://img.shields.io/badge/go-1.22+-007d9c)](https://go.dev/)
 
 ## 1. Overview
 
@@ -49,7 +55,7 @@ This layer handles how the world sees your telemetry. It is designed to be "Swag
 * **Flexible Configuration:** Struct-based config with YAML support. Blank fields use sensible defaults.
 * **Dual Hook API:** Both fluent registration and middleware chain patterns for metric collection.
 * **Zero-Blocking:** Non-blocking metric ingestion via bounded channels ensures request lifecycle is never impacted.
-* **High-Cardinality Safety:** Bucketed counts prevent cardinality explosion (no per-user metrics).
+* **High-Cardinality Safety:** Path normalization, label truncation, and a configurable cardinality guard prevent unbounded series growth.
 * **Context-Based Lifecycle:** Graceful shutdown with context stored in Registry struct.
 * **Histogram Time-Series:** Visualize histogram bucket distribution evolution over time with stacked area charts, enabling analysis of distribution trends and patterns.
 
@@ -177,6 +183,7 @@ ui:
 
 ingest_queue_size: 4096  # saturation drops samples (never blocks requests)
 max_metrics: 10000       # in-memory series cap (LRU eviction)
+max_endpoints: 128       # per-endpoint latency cap
 metric_ttl: 1h
 flush_interval: 30s
 
@@ -184,6 +191,12 @@ include_patterns: []     # empty = track everything
 exclude_patterns:
   - ^/health$
   - ^/metrics
+
+labels:
+  normalize_paths: true  # collapse /users/123 → /users/:id (default: true)
+  max_length: 64         # truncate long label values (0 = no limit)
+
+max_label_series_per_metric: 256  # cardinality guard per metric (0 = unlimited)
 
 runtime_metrics:
   enabled: true          # collect Go runtime stats (memory, goroutines)
@@ -258,6 +271,7 @@ Open `/metrics`. The dashboard is server-side rendered with HTMX polling (defaul
 - **Search** filters metrics by name.
 - **+ Add Chart** opens a modal with metric autocomplete.
 - **Pause** halts polling.
+- **GoLens Internals** section shows per-metric cardinality stats (series counts, cap, dropped samples).
 - Programmatic JSON is available at `/metrics/data` (`Accept: application/json` or `?format=json`); a single metric at `/metrics/data?metric=<name>`.
 
 ### Production export (OTLP)
@@ -297,6 +311,35 @@ Collected metrics:
 | `go_memstats_heap_objects` | Gauge | Total number of allocated objects |
 | `go_goroutines` | Gauge | Current number of goroutines |
 
+### Cardinality management
+
+GoLens protects against unbounded label cardinality at three levels:
+
+**1. Path normalization** — the `path` label on RED metrics automatically collapses dynamic segments (`/users/123` → `/users/:id`, UUIDs, hex hashes). Controlled by `labels.normalize_paths` (default: `true`).
+
+**2. Label value truncation** — long label values are capped at `labels.max_length` characters (default: `0` = unlimited).
+
+**3. Cardinality guard** — `max_label_series_per_metric` (default: `256`) caps unique label combinations per metric name. When exceeded, new combinations are silently dropped. Set to `0` to disable.
+
+The **GoLens Internals** section on the dashboard shows per-metric series counts, the configured cap, and how many samples were dropped. This gives you visibility into cardinality growth without requiring external tooling.
+
+```yaml
+labels:
+  normalize_paths: true   # collapse /users/123 → /users/:id
+  max_length: 64          # truncate long values (0 = no limit)
+
+max_label_series_per_metric: 256  # 0 = unlimited
+```
+
+Or in code:
+
+```go
+cfg := golens.DefaultConfig()
+cfg.Labels.NormalizePaths = true
+cfg.Labels.MaxLength = 64
+cfg.MaxLabelSeriesPerMetric = 256
+```
+
 ### Graceful shutdown
 
 GoLens stores the context on the Registry. Cancelling it triggers a final flush of roll-ups to storage and a final OTLP batch, then stops all goroutines:
@@ -323,21 +366,63 @@ make run-gin        # builds and runs examples/gin on :8080
 # then visit http://localhost:8080/metrics
 curl http://localhost:8080/?fail=1     # generate an error
 curl http://localhost:8080/order?sku=ABC
+curl http://localhost:8080/tenant?tenant=acme  # cardinality-bounded label demo
 ```
 
 ### Development
 
+#### Build
+
 ```bash
-make build         # compile all packages
-make test          # unit tests
-make test-race     # tests with the race detector
-make cover         # coverage summary (library target: 95%)
-make vet           # go vet
-make lint          # golangci-lint (if installed)
-make fmt           # gofmt + goimports
+make build              # compile all packages (binaries go to /dev/null)
+make example            # compile example servers to bin/
 ```
 
-CI runs the build/vet/race-test/coverage matrix across Go 1.22–1.24 plus golangci-lint on every push and pull request (`.github/workflows/ci.yml`).
+#### Test
+
+```bash
+make test               # run unit tests
+make test-race          # run tests with the race detector
+make cover              # coverage summary (library target: 95%)
+make cover-ci           # coverage matching CI (race + atomic mode)
+```
+
+Run a specific test or set of tests:
+
+```bash
+go test -run TestNormalizePath ./...                    # single test
+go test -run "TestCardinality|TestSanitize" ./...       # pattern match
+go test -run TestRegistry -v ./...                      # verbose output
+go test -race -count=3 ./...                            # repeat to catch flakes
+```
+
+#### Lint & format
+
+```bash
+make vet                # go vet
+make lint               # golangci-lint (if installed)
+make fmt                # gofmt + goimports
+make tidy               # go mod tidy
+make tidy-check         # verify go.mod/go.sum are clean (CI gate)
+```
+
+#### Full CI pipeline locally
+
+```bash
+make ci                 # build → vet → tidy-check → lint → race tests
+```
+
+#### Run examples
+
+```bash
+make run-stdlib         # examples/stdlibmux on :8080
+make run-gin            # examples/gin on :8080
+make run-basic-authed-gin    # examples/basic-authed-gin on :8080
+make run-token-authed-gin    # examples/token-authed-gin on :8080
+make clean              # remove build artifacts
+```
+
+CI runs the build/vet/race-test/coverage matrix across Go 1.22–1.24 on every push and pull request (`.github/workflows/ci.yml`).
 
 ## 8. Attribution
 

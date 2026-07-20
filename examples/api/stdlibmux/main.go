@@ -225,6 +225,32 @@ func main() {
 		_, _ = w.Write([]byte("response size tracked\n"))
 	})))
 
+	// Demonstrate cardinality-aware labels: this counter tracks requests by
+	// "tenant" — a label that could grow unbounded in a multi-tenant system.
+	// GoLens's cardinality guard (configured via max_label_series_per_metric)
+	// will automatically drop new tenant label combinations once the cap is
+	// hit, preventing unbounded series growth. Check the "GoLens Internals"
+	// section on the dashboard to see series counts and dropped samples.
+	tenantRequests := registry.On("tenant_requests_total").
+		Type(golens.CounterType).
+		Description("requests per tenant (cardinality-bounded)").
+		Labels("tenant").
+		Extract(func(req *http.Request) (float64, []golens.Label) {
+			tenant := req.URL.Query().Get("tenant")
+			if tenant == "" {
+				tenant = "default"
+			}
+			return 1, []golens.Label{{Name: "tenant", Value: tenant}}
+		})
+	mux.Handle("/tenant", tenantRequests(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tenant := r.URL.Query().Get("tenant")
+		if tenant == "" {
+			tenant = "default"
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("tenant request tracked: " + tenant + "\n"))
+	})))
+
 	srv := &http.Server{Addr: ":8080", Handler: registry.Middleware(mux)}
 	go func() {
 		log.Println("GoLens (stdlib mux) listening on :8080 (dashboard at /metrics)")

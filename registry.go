@@ -34,7 +34,8 @@ type Registry struct {
 	exporter *otlpExporter
 	agg      *aggregator
 
-	endpoints *endpointTracker
+	endpoints   *endpointTracker
+	cardinality *cardinalityTracker
 
 	auth authState
 
@@ -103,6 +104,8 @@ func New(cfg Config) (*Registry, error) {
 	r.agg = newAggregator(r.storage, cfg.FlushInterval)
 
 	r.endpoints = newEndpointTracker(cfg.MaxEndpoints)
+
+	r.cardinality = newCardinalityTracker(cfg.MaxLabelSeriesPerMetric, cfg.Debug)
 
 	if cfg.OTLP.Enabled {
 		r.exporter = newOTLPExporter(cfg.OTLP)
@@ -251,6 +254,17 @@ func (r *Registry) loop() {
 
 // process applies an ingested sample to the metric store.
 func (r *Registry) process(s *sample) {
+	// Sanitize labels before processing.
+	s.labels = SanitizeLabels(s.labels, r.cfg.Labels)
+
+	// Check cardinality guard — drop if this label combo exceeds the cap.
+	if len(s.labels) > 0 && !r.cardinality.Allow(s.name, s.labels) {
+		if r.debug {
+			log.Printf("[golens] cardinality cap reached for %s; dropped sample", s.name)
+		}
+		return
+	}
+
 	r.mu.Lock()
 	m, ok := r.metrics[s.name]
 	if !ok {
@@ -427,4 +441,22 @@ func (r *Registry) EndpointLatency() []EndpointLatencySnapshot {
 		return nil
 	}
 	return r.endpoints.Snapshots()
+}
+
+// CardinalitySnapshots returns per-metric cardinality state for the dashboard
+// internals panel. Each entry shows how many unique label series exist for a
+// metric, the configured cap, and how many samples were dropped.
+func (r *Registry) CardinalitySnapshots() []CardinalitySnapshot {
+	series := r.cardinality.AllSeriesCounts()
+	dropped := r.cardinality.AllDroppedCounts()
+	out := make([]CardinalitySnapshot, 0, len(series))
+	for name, count := range series {
+		out = append(out, CardinalitySnapshot{
+			MetricName: name,
+			Series:     count,
+			MaxSeries:  r.cfg.MaxLabelSeriesPerMetric,
+			Dropped:    dropped[name],
+		})
+	}
+	return out
 }
