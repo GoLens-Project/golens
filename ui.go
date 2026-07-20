@@ -41,6 +41,9 @@ func (r *Registry) MountUI(mux *http.ServeMux) {
 	mux.Handle("/metrics/endpoints", wrap(func(w http.ResponseWriter, req *http.Request) {
 		writeJSON(w, r.EndpointLatency())
 	}))
+	mux.Handle("/metrics/cardinality", wrap(func(w http.ResponseWriter, req *http.Request) {
+		writeJSON(w, r.CardinalitySnapshots())
+	}))
 	mux.Handle("/metrics/history", wrap(r.metricsHistoryHandler()))
 	mux.Handle("/favicon.ico", wrap(r.faviconHandler))
 }
@@ -72,6 +75,18 @@ func (r *Registry) EndpointsHTTPHandler() http.Handler {
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		writeJSON(w, r.EndpointLatency())
+	})
+}
+
+// CardinalityHTTPHandler returns per-metric cardinality snapshots as JSON,
+// showing unique label series counts and dropped samples. Returns nil if the
+// UI is disabled.
+func (r *Registry) CardinalityHTTPHandler() http.Handler {
+	if !r.cfg.UI.Enabled {
+		return nil
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		writeJSON(w, r.CardinalitySnapshots())
 	})
 }
 
@@ -118,6 +133,7 @@ func (r *Registry) metricsPageHandler() http.Handler {
 			"Interval":       r.cfg.UI.PollInterval.String(),
 			"RuntimeEnabled": r.cfg.RuntimeMetrics.Enabled,
 			"ProjectName":    r.cfg.ProjectName,
+			"MaxLabelSeries": r.cfg.MaxLabelSeriesPerMetric,
 		}
 		// Render to a buffer first so a template error never produces a
 		// half-written response (which would force a superfluous WriteHeader).
@@ -1019,6 +1035,79 @@ const dashboardSrc = `<!DOCTYPE html>
       </template>
     </div>
   </section>
+
+  <!-- GoLens Internals: cardinality tracking and system stats -->
+  <section x-data="cardinalityPanel({{.PollMs}}, {{.MaxLabelSeries}})" class="mt-8" x-cloak>
+    <button @click="open = !open"
+            class="flex items-center gap-2 mb-3 group cursor-pointer">
+      <svg class="w-3 h-3 text-slate-500 transition-transform" :class="open ? 'rotate-90' : ''" viewBox="0 0 20 20" fill="currentColor">
+        <path fill-rule="evenodd" d="M7.21 14.77a.75.75 0 01.02-1.06L11.168 10 7.23 6.29a.75.75 0 111.04-1.08l4.5 4.25a.75.75 0 010 1.08l-4.5 4.25a.75.75 0 01-1.06-.02z" clip-rule="evenodd"/>
+      </svg>
+      <h2 class="text-xs font-mono uppercase tracking-wider text-slate-500 group-hover:text-slate-400 transition">GoLens Internals</h2>
+      <span class="text-[10px] font-mono text-slate-600">· cardinality & system</span>
+    </button>
+    <div x-show="open" x-transition.duration.200ms>
+      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5 mb-5">
+        <!-- Summary cards -->
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+          <div class="text-[10px] font-mono text-slate-500 uppercase mb-1">Total Series</div>
+          <div class="text-2xl font-mono font-semibold text-white" x-text="totalSeries"></div>
+          <div class="text-[10px] font-mono text-slate-600 mt-1">across <span x-text="metricCount"></span> metrics</div>
+        </div>
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+          <div class="text-[10px] font-mono text-slate-500 uppercase mb-1">Total Dropped</div>
+          <div class="text-2xl font-mono font-semibold" :class="totalDropped > 0 ? 'text-amber-400' : 'text-emerald-400'" x-text="totalDropped"></div>
+          <div class="text-[10px] font-mono text-slate-600 mt-1">samples rejected by guard</div>
+        </div>
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+          <div class="text-[10px] font-mono text-slate-500 uppercase mb-1">Series Cap</div>
+          <div class="text-2xl font-mono font-semibold text-white" x-text="maxSeries === 0 ? '∞' : maxSeries"></div>
+          <div class="text-[10px] font-mono text-slate-600 mt-1">per metric (<span x-text="maxSeries === 0 ? 'unlimited' : 'configured'"></span>)</div>
+        </div>
+      </div>
+
+      <!-- Per-metric detail table -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+        <div class="px-5 py-3 border-b border-slate-800 flex items-center justify-between">
+          <span class="text-xs font-mono text-slate-400">Per-Metric Cardinality</span>
+          <span class="text-[10px] font-mono text-slate-600" x-text="metrics.length + ' metrics'"></span>
+        </div>
+        <div class="overflow-x-auto">
+          <table class="w-full text-xs font-mono">
+            <thead>
+              <tr class="text-slate-500 text-left">
+                <th class="px-5 py-2 font-medium">Metric</th>
+                <th class="px-5 py-2 font-medium text-right">Series</th>
+                <th class="px-5 py-2 font-medium text-right">Cap</th>
+                <th class="px-5 py-2 font-medium text-right">Dropped</th>
+                <th class="px-5 py-2 font-medium">Usage</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-for="m in metrics" :key="m.metric_name">
+                <tr class="border-t border-slate-800/50 hover:bg-slate-800/30 transition">
+                  <td class="px-5 py-2 text-slate-300" x-text="m.metric_name"></td>
+                  <td class="px-5 py-2 text-right text-slate-200" x-text="m.series"></td>
+                  <td class="px-5 py-2 text-right text-slate-500" x-text="m.max_series === 0 ? '∞' : m.max_series"></td>
+                  <td class="px-5 py-2 text-right" :class="m.dropped > 0 ? 'text-amber-400' : 'text-slate-500'" x-text="m.dropped"></td>
+                  <td class="px-5 py-2">
+                    <div class="w-full bg-slate-800 rounded-full h-1.5 max-w-[120px]">
+                      <div class="h-1.5 rounded-full transition-all"
+                           :class="usagePct(m) >= 90 ? 'bg-rose-500' : usagePct(m) >= 70 ? 'bg-amber-500' : 'bg-emerald-500'"
+                           :style="'width:' + Math.min(100, usagePct(m)) + '%'"></div>
+                    </div>
+                  </td>
+                </tr>
+              </template>
+              <tr x-show="metrics.length === 0">
+                <td colspan="5" class="px-5 py-4 text-center text-slate-600">No cardinality data yet.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
 </main>
 
 <!-- Add-chart modal (Alpine): lists all currently-available metrics by default,
@@ -1298,6 +1387,26 @@ const dashboardSrc = `<!DOCTYPE html>
         cards.forEach(c => grid.appendChild(c));
       }
     } catch(e){}
+  }
+
+  // Cardinality panel: polls /metrics/cardinality and shows per-metric series stats.
+  function cardinalityPanel(pollMs, maxSeries){
+    return {
+      open: false,
+      metrics: [],
+      maxSeries: maxSeries,
+      init(){ this.load(); setInterval(() => { if (this.open) this.load(); }, pollMs); },
+      load(){
+        fetch('/metrics/cardinality').then(r => r.json()).then(d => { this.metrics = d || []; }).catch(() => {});
+      },
+      get totalSeries(){ return this.metrics.reduce((s, m) => s + m.series, 0); },
+      get totalDropped(){ return this.metrics.reduce((s, m) => s + m.dropped, 0); },
+      get metricCount(){ return this.metrics.length; },
+      usagePct(m){
+        if (!m.max_series) return 0;
+        return Math.round((m.series / m.max_series) * 100);
+      }
+    };
   }
 
   // Boot: apply persisted All Metrics order + wire up its drag-and-drop.

@@ -34,6 +34,13 @@ type Config struct {
 	// instrumented. Empty includes means "all"; excludes win over includes.
 	IncludePatterns []string `yaml:"include_patterns"`
 	ExcludePatterns []string `yaml:"exclude_patterns"`
+
+	// Labels controls label value sanitization and cardinality limits.
+	Labels LabelsConfig `yaml:"labels"`
+
+	// MaxLabelSeriesPerMetric caps unique label combinations per metric name.
+	// When exceeded, new label combinations are dropped. 0 = unlimited.
+	MaxLabelSeriesPerMetric int `yaml:"max_label_series_per_metric"`
 }
 
 // StorageConfig controls persistence.
@@ -59,6 +66,15 @@ type UIConfig struct {
 	Enabled      bool          `yaml:"enabled"`
 	PollInterval time.Duration `yaml:"poll_interval"`
 	Auth         AuthConfig    `yaml:"auth"`
+}
+
+// LabelsConfig controls label value sanitization and cardinality management.
+type LabelsConfig struct {
+	// NormalizePaths applies :id normalization to "path" label values,
+	// collapsing numeric, UUID, and hex segments. Default: true.
+	NormalizePaths bool `yaml:"normalize_paths"`
+	// MaxLength truncates label values longer than this (0 = no limit).
+	MaxLength int `yaml:"max_length"`
 }
 
 // RuntimeMetricsConfig controls optional Go runtime metrics collection.
@@ -122,7 +138,12 @@ func DefaultConfig() Config {
 		IngestQueueSize: 4096,
 		MaxMetrics:      10_000,
 		MaxEndpoints:    128,
-		MetricTTL:       1 * time.Hour,
+		Labels: LabelsConfig{
+			NormalizePaths: true,
+			MaxLength:      0,
+		},
+		MaxLabelSeriesPerMetric: 256,
+		MetricTTL:               1 * time.Hour,
 		FlushInterval:   30 * time.Second,
 		// Exclude the dashboard routes so the UI's own HTMX polling doesn't
 		// inflate the request/error counters (self-instrumentation feedback).

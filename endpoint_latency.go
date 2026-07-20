@@ -2,7 +2,6 @@ package golens
 
 import (
 	"sort"
-	"strings"
 	"sync"
 )
 
@@ -33,45 +32,6 @@ func newEndpointTracker(max int) *endpointTracker {
 		max = 128
 	}
 	return &endpointTracker{max: max, bounds: endpointBounds, series: make(map[string]*latencySeries)}
-}
-
-// idSegment matches high-cardinality path segments: pure numbers, UUIDs, and
-// long hex hashes. These are collapsed to ":id" so per-endpoint series stay
-// bounded regardless of how many distinct IDs hit the route.
-func idSegment(seg string) bool {
-	if seg == "" {
-		return false
-	}
-	digits, hex := 0, 0
-	for _, r := range seg {
-		switch {
-		case r >= '0' && r <= '9':
-			digits++
-			hex++
-		case (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F'):
-			hex++
-		case r == '-':
-			// allow UUID-style separators
-		default:
-			return false
-		}
-	}
-	// all-digit of any length, or hex/hash/uuid of length (>=8 hex chars)
-	return digits == len(seg) || hex >= 8
-}
-
-// normalizePath collapses id-like segments to ":id".
-func normalizePath(path string) string {
-	if path == "" {
-		return "/"
-	}
-	parts := strings.Split(strings.Trim(path, "/"), "/")
-	for i, seg := range parts {
-		if idSegment(seg) {
-			parts[i] = ":id"
-		}
-	}
-	return "/" + strings.Join(parts, "/")
 }
 
 // Observe records a latency sample for the given endpoint.
