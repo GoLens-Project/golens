@@ -102,7 +102,7 @@ This layer handles how the world sees your telemetry. It is designed to be "Swag
 ### Install
 
 ```bash
-go get golens
+go get github.com/GoLens-Project/golens
 ```
 
 GoLens depends only on two pure-Go libraries at runtime (`gopkg.in/yaml.v3` for config and `modernc.org/sqlite` for optional persistence — no CGo).
