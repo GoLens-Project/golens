@@ -15,6 +15,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
 	"net/http"
 	"os"
@@ -28,9 +29,16 @@ import (
 )
 
 func main() {
+	useMailer := flag.Bool("mailer", false, "enable log email notifier")
+	flag.Parse()
+
 	cfg := golens.DefaultConfig()
+	cfg.ProjectName = "Example API"
+	cfg.DashboardSubtitle = "Example Dashboard"
 	cfg.Debug = true
 	cfg.RuntimeMetrics.Enabled = true
+	cfg.Alerts.Enabled = true
+	cfg.Alerts.EvaluationInterval = 30 * time.Second
 	if path := os.Getenv("GOLENS_CONFIG"); path != "" {
 		if loaded, err := golens.LoadConfig(path); err == nil {
 			cfg = loaded
@@ -40,6 +48,11 @@ func main() {
 	registry, err := golens.New(cfg)
 	if err != nil {
 		log.Fatalf("golens: %v", err)
+	}
+
+	if *useMailer {
+		registry.SetEmailNotifier(golens.NewLogNotifier())
+		log.Println("mailer enabled: email notifications will be logged to stdout")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -71,6 +84,11 @@ func main() {
 	mountHTTPHandler(r, "/metrics/endpoints", registry.EndpointsHTTPHandler())
 	mountHTTPHandler(r, "/metrics/cardinality", registry.CardinalityHTTPHandler())
 	mountHTTPHandler(r, "/metrics/history", registry.HistoryHTTPHandler())
+	mountHTTPHandler(r, "/metrics/alerts", registry.AlertsPageHTTPHandler())
+	mountHTTPHandler(r, "/metrics/alerts/rules", registry.AlertRulesHTTPHandler())
+	mountHTTPHandler(r, "/metrics/alerts/rules/", registry.AlertRulesDeleteHTTPHandler())
+	mountHTTPHandler(r, "/metrics/alerts/log", registry.AlertLogHTTPHandler())
+	mountHTTPHandler(r, "/metrics/alerts/templates", registry.AlertTemplatesHTTPHandler())
 
 	r.GET("/", func(c *gin.Context) {
 		time.Sleep(5 * time.Millisecond) // simulate work

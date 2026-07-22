@@ -39,6 +39,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
+	"flag"
 	"log"
 	"net/http"
 	"os"
@@ -59,13 +60,25 @@ const (
 )
 
 func main() {
+	useMailer := flag.Bool("mailer", false, "enable log email notifier")
+	flag.Parse()
+
 	// Built-in auth OFF: the custom middleware below owns access control.
 	cfg := golens.DefaultConfig()
+	cfg.ProjectName = "Example API"
+	cfg.DashboardSubtitle = "Example Dashboard"
 	cfg.RuntimeMetrics.Enabled = true
+	cfg.Alerts.Enabled = true
+	cfg.Alerts.EvaluationInterval = 30 * time.Second
 
 	registry, err := golens.New(cfg)
 	if err != nil {
 		log.Fatalf("golens: %v", err)
+	}
+
+	if *useMailer {
+		registry.SetEmailNotifier(golens.NewLogNotifier())
+		log.Println("mailer enabled: email notifications will be logged to stdout")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -99,6 +112,13 @@ func main() {
 		metrics.GET("/data", gin.WrapF(registry.DataHandler))
 		metrics.GET("/endpoints", gin.WrapH(registry.EndpointsHTTPHandler()))
 		metrics.GET("/history", gin.WrapH(registry.HistoryHTTPHandler()))
+		// Alert subsystem.
+		metrics.GET("/alerts", gin.WrapH(registry.AlertsPageHTTPHandler()))
+		metrics.GET("/alerts/rules", gin.WrapH(registry.AlertRulesHTTPHandler()))
+		metrics.POST("/alerts/rules", gin.WrapH(registry.AlertRulesHTTPHandler()))
+		metrics.DELETE("/alerts/rules/:id", gin.WrapH(registry.AlertRulesDeleteHTTPHandler()))
+		metrics.GET("/alerts/log", gin.WrapH(registry.AlertLogHTTPHandler()))
+		metrics.GET("/alerts/templates", gin.WrapH(registry.AlertTemplatesHTTPHandler()))
 	}
 
 	srv := &http.Server{Addr: ":8080", Handler: registry.Middleware(r)}

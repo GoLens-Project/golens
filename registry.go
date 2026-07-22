@@ -2,6 +2,8 @@ package golens
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"log"
 	"regexp"
 	"runtime"
@@ -36,6 +38,9 @@ type Registry struct {
 
 	endpoints   *endpointTracker
 	cardinality *cardinalityTracker
+
+	alertStore AlertStore
+	alerter    *alerter
 
 	auth authState
 
@@ -106,6 +111,38 @@ func New(cfg Config) (*Registry, error) {
 	r.endpoints = newEndpointTracker(cfg.MaxEndpoints)
 
 	r.cardinality = newCardinalityTracker(cfg.MaxLabelSeriesPerMetric, cfg.Debug)
+
+	// Alert subsystem: store + evaluator.
+	if cfg.Alerts.Enabled {
+		var alertDB *sql.DB
+		// If the main storage is SQLite, reuse its connection for alerts.
+		if s, ok := r.storage.(*sqliteStorage); ok {
+			r.alertStore = newAlertStoreFromDB(s.db)
+			alertDB = s.db
+		} else {
+			var err error
+			r.alertStore, alertDB, err = newAlertStore(cfg.Storage)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if err := r.alertStore.InitRules(context.Background()); err != nil {
+			if alertDB != nil {
+				alertDB.Close()
+			}
+			return nil, fmt.Errorf("golens: init alert store: %w", err)
+		}
+		if len(cfg.Alerts.Rules) > 0 {
+			_ = r.alertStore.SeedFromConfig(context.Background(), cfg.Alerts.Rules)
+		}
+		r.alerter = newAlerter(r, r.alertStore, cfg.Alerts)
+		// Load persisted rules into the alerter.
+		if stored, err := r.alertStore.LoadRules(context.Background()); err == nil {
+			for _, rule := range stored {
+				r.alerter.rules[rule.ID] = &rule
+			}
+		}
+	}
 
 	if cfg.OTLP.Enabled {
 		r.exporter = newOTLPExporter(cfg.OTLP)
@@ -208,6 +245,10 @@ func (r *Registry) Start(ctx context.Context) error {
 		if r.cfg.RuntimeMetrics.Enabled {
 			startRuntimeMetrics(ctx, r, r.cfg.RuntimeMetrics.Interval)
 		}
+		// Standalone alert mode: run the alerter in its own goroutine.
+		if r.alerter != nil && r.cfg.Alerts.Mode == "standalone" {
+			go r.alerter.run(ctx)
+		}
 	}
 	return nil
 }
@@ -225,6 +266,12 @@ func (r *Registry) loop() {
 		t := time.NewTicker(r.cfg.OTLP.Interval)
 		export = t.C
 		defer t.Stop()
+	}
+
+	// Integrated alert mode: ticker channel consumed here in the main loop.
+	var alertTick <-chan time.Time
+	if r.alerter != nil && r.cfg.Alerts.Mode == "integrated" {
+		alertTick = r.alerter.C()
 	}
 
 	// Resolve the shutdown channel once; the loop body must not re-evaluate
@@ -246,6 +293,8 @@ func (r *Registry) loop() {
 			r.process(s)
 		case <-flush.C:
 			r.agg.flushAll(r)
+		case <-alertTick:
+			r.alerter.evaluate(r.ctx)
 		case <-export:
 			r.exportBatch()
 		}
@@ -306,6 +355,9 @@ func (r *Registry) finalFlush() {
 	r.agg.flushAll(r)
 	if r.exporter != nil {
 		r.exportBatch()
+	}
+	if r.alertStore != nil {
+		_ = r.alertStore.Close()
 	}
 	_ = r.storage.Close()
 }
@@ -459,4 +511,48 @@ func (r *Registry) CardinalitySnapshots() []CardinalitySnapshot {
 		})
 	}
 	return out
+}
+
+// SetEmailNotifier injects a custom email notifier for alert delivery.
+// Call this after New and before Start. When nil (the default), alerts fire
+// silently (log + store only).
+func (r *Registry) SetEmailNotifier(n EmailNotifier) {
+	if r.alerter != nil {
+		r.alerter.SetEmailNotifier(n)
+	}
+}
+
+// Alerter returns the alert evaluator, or nil if alerts are disabled.
+func (r *Registry) Alerter() *alerter { return r.alerter }
+
+// AlertRules returns the current alert rules as JSON-serializable data.
+func (r *Registry) AlertRules() []AlertRule {
+	if r.alerter == nil {
+		return nil
+	}
+	return r.alerter.ListRules()
+}
+
+// AlertLog returns the most recent alert firing entries.
+func (r *Registry) AlertLog(limit int) []AlertLogEntry {
+	if r.alertStore == nil {
+		return nil
+	}
+	ctx := r.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	entries, err := r.alertStore.ListLog(ctx, limit)
+	if err != nil {
+		return nil
+	}
+	return entries
+}
+
+// AlertTemplates returns the available predefined email templates for alerts.
+func (r *Registry) AlertTemplates() []AlertTemplate {
+	if r.alerter == nil {
+		return nil
+	}
+	return r.alerter.Templates()
 }

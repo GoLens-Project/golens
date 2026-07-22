@@ -53,6 +53,11 @@ exclude_patterns:
 # Custom name shown in the dashboard header. Defaults to "GoLens" if not set.
 project_name: GoLens
 
+# --- Dashboard subtitle ---
+# Subtitle shown next to the project name in the header. Defaults to
+# "discovery dashboard" if not set.
+dashboard_subtitle: discovery dashboard
+
 # --- Go runtime metrics ---
 # Optional collection of Go runtime stats (memory, goroutines) as gauge
 # metrics visible in the /metrics dashboard.
@@ -62,3 +67,42 @@ runtime_metrics:
 
 # --- Diagnostics ---
 debug: false                 # verbose logging of record/drop/flush/export
+
+# --- Alerting ---
+# Threshold-based alerting with optional email notifications. Rules can be
+# seeded here and/or managed dynamically via the /metrics/alerts UI.
+# Alert rules and log entries are persisted when storage.backend: sqlite.
+alerts:
+  enabled: false               # set true to enable the alerting subsystem
+  mode: integrated             # "integrated" (single goroutine) or "standalone" (own goroutine)
+  evaluation_interval: 30s     # how often rules are evaluated
+  default_cooldown: 5m         # default cooldown between firings per rule
+  log_persist: true            # persist alert log entries to storage backend
+  rules: []                    # seed rules from config (can also manage via UI/API)
+  # Example rule:
+  # rules:
+  #   - id: high-error-rate
+  #     name: High Error Rate
+  #     metric: http_request_errors_total
+  #     condition: gt           # gt, gte, lt, lte, eq
+  #     threshold: 100
+  #     cooldown: 5m
+  #     enabled: true
+  #     email_to: [team@example.com]
+  #     # Subject and body support Go templates with these fields:
+  #     #   {{.RuleName}}        — rule name
+  #     #   {{.RuleID}}          — rule ID
+  #     #   {{.Metric}}          — metric name
+  #     #   {{.Value}}           — current value (2 decimal places)
+  #     #   {{.Threshold}}       — threshold (2 decimal places)
+  #     #   {{.Condition}}       — raw condition (gt, lt, gte, lte, eq)
+  #     #   {{.ConditionLabel}}  — human-readable (>, <, >=, <=, ==)
+  #     #   {{.FiredAt}}         — fire timestamp
+  #     #   {{.ProjectName}}     — project name
+  #     email_subject: "{{.ProjectName}} Alert: {{.RuleName}}"
+  #     email_body: |
+  #       Alert: {{.RuleName}}
+  #       Metric: {{.Metric}}
+  #       Value: {{.Value}} {{.ConditionLabel}} {{.Threshold}}
+  #       Fired at: {{.FiredAt}}
+  #     email_html: false

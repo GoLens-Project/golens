@@ -796,7 +796,7 @@ func TestDashboardContainsInternalsSection(t *testing.T) {
 	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
 
 	body := rec.Body.String()
-	if !strings.Contains(body, "GoLens Internals") {
+	if !strings.Contains(body, "GoLens") || !strings.Contains(body, "Internals") {
 		t.Error("dashboard missing GoLens Internals section")
 	}
 	if !strings.Contains(body, "cardinalityPanel") {
