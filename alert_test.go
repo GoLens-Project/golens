@@ -690,10 +690,10 @@ func TestEvaluateEmailNotification(t *testing.T) {
 	r.Start(ctx)
 	defer func() { cancel(); r.Close() }()
 
-	// Track sent emails
-	var sentMsg EmailMessage
+	// Track sent emails using a channel for synchronization
+	emailCh := make(chan EmailMessage, 1)
 	mockNotifier := &mockEmailNotifier{sendFn: func(ctx context.Context, msg EmailMessage) error {
-		sentMsg = msg
+		emailCh <- msg
 		return nil
 	}}
 	r.Alerter().SetEmailNotifier(mockNotifier)
@@ -714,13 +714,18 @@ func TestEvaluateEmailNotification(t *testing.T) {
 	})
 
 	al.evaluate(context.Background())
-	time.Sleep(10 * time.Millisecond) // Wait for goroutine
 
-	if sentMsg.Subject != "Test Alert: email test" {
-		t.Errorf("subject = %q, want 'Test Alert: email test'", sentMsg.Subject)
-	}
-	if sentMsg.Body != "Value: 42.00" {
-		t.Errorf("body = %q, want 'Value: 42.00'", sentMsg.Body)
+	// Wait for email to be sent with timeout
+	select {
+	case sentMsg := <-emailCh:
+		if sentMsg.Subject != "Test Alert: email test" {
+			t.Errorf("subject = %q, want 'Test Alert: email test'", sentMsg.Subject)
+		}
+		if sentMsg.Body != "Value: 42.00" {
+			t.Errorf("body = %q, want 'Value: 42.00'", sentMsg.Body)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("email not sent within timeout")
 	}
 }
 
@@ -732,9 +737,9 @@ func TestEvaluateEmailHTML(t *testing.T) {
 	r.Start(ctx)
 	defer func() { cancel(); r.Close() }()
 
-	var sentMsg EmailMessage
+	emailCh := make(chan EmailMessage, 1)
 	mockNotifier := &mockEmailNotifier{sendFn: func(ctx context.Context, msg EmailMessage) error {
-		sentMsg = msg
+		emailCh <- msg
 		return nil
 	}}
 	r.Alerter().SetEmailNotifier(mockNotifier)
@@ -755,13 +760,17 @@ func TestEvaluateEmailHTML(t *testing.T) {
 	})
 
 	al.evaluate(context.Background())
-	time.Sleep(10 * time.Millisecond)
 
-	if !sentMsg.IsHTML {
-		t.Error("expected IsHTML = true")
-	}
-	if sentMsg.Body != "<b>Value: 42.00</b>" {
-		t.Errorf("body = %q, want '<b>Value: 42.00</b>'", sentMsg.Body)
+	select {
+	case sentMsg := <-emailCh:
+		if !sentMsg.IsHTML {
+			t.Error("expected IsHTML = true")
+		}
+		if sentMsg.Body != "<b>Value: 42.00</b>" {
+			t.Errorf("body = %q, want '<b>Value: 42.00</b>'", sentMsg.Body)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("email not sent within timeout")
 	}
 }
 
