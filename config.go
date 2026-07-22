@@ -14,7 +14,8 @@ type Config struct {
 	OTLP           OTLPConfig           `yaml:"otlp"`
 	UI             UIConfig             `yaml:"ui"`
 	RuntimeMetrics RuntimeMetricsConfig `yaml:"runtime_metrics"`
-	ProjectName    string               `yaml:"project_name"`
+	ProjectName       string               `yaml:"project_name"`
+	DashboardSubtitle string               `yaml:"dashboard_subtitle"`
 	Debug          bool                 `yaml:"debug"`
 
 	// IngestQueueSize bounds the non-blocking ingestion channel. When full,
@@ -41,6 +42,9 @@ type Config struct {
 	// MaxLabelSeriesPerMetric caps unique label combinations per metric name.
 	// When exceeded, new label combinations are dropped. 0 = unlimited.
 	MaxLabelSeriesPerMetric int `yaml:"max_label_series_per_metric"`
+
+	// Alerts configures the threshold-based alerting subsystem.
+	Alerts AlertsConfig `yaml:"alerts"`
 }
 
 // StorageConfig controls persistence.
@@ -81,6 +85,16 @@ type LabelsConfig struct {
 type RuntimeMetricsConfig struct {
 	Enabled  bool          `yaml:"enabled"`
 	Interval time.Duration `yaml:"interval"` // collection interval, default 15s
+}
+
+// AlertsConfig controls the threshold-based alerting subsystem.
+type AlertsConfig struct {
+	Enabled            bool          `yaml:"enabled"`
+	Mode               string        `yaml:"mode"`                // "integrated" (default) or "standalone"
+	EvaluationInterval time.Duration `yaml:"evaluation_interval"` // how often rules are evaluated
+	DefaultCooldown    time.Duration `yaml:"default_cooldown"`    // default cooldown between firings
+	LogPersist         bool          `yaml:"log_persist"`         // persist alert log to storage backend
+	Rules              []AlertRule   `yaml:"rules"`               // seed rules from config file
 }
 
 // AuthConfig enables optional admin-only HTTP Basic Auth on the dashboard.
@@ -134,7 +148,8 @@ func DefaultConfig() Config {
 			Enabled:      true,
 			PollInterval: 5 * time.Second,
 		},
-		ProjectName:     "GoLens",
+		ProjectName:       "GoLens",
+		DashboardSubtitle: "discovery dashboard",
 		IngestQueueSize: 4096,
 		MaxMetrics:      10_000,
 		MaxEndpoints:    128,
@@ -144,6 +159,13 @@ func DefaultConfig() Config {
 		},
 		MaxLabelSeriesPerMetric: 256,
 		MetricTTL:               1 * time.Hour,
+		Alerts: AlertsConfig{
+			Enabled:            false,
+			Mode:               "integrated",
+			EvaluationInterval: 30 * time.Second,
+			DefaultCooldown:    5 * time.Minute,
+			LogPersist:         true,
+		},
 		FlushInterval:   30 * time.Second,
 		// Exclude the dashboard routes so the UI's own HTMX polling doesn't
 		// inflate the request/error counters (self-instrumentation feedback).
@@ -212,5 +234,17 @@ func (c *Config) applyDefaults() {
 	}
 	if c.RuntimeMetrics.Interval == 0 {
 		c.RuntimeMetrics.Interval = 15 * time.Second
+	}
+	if c.DashboardSubtitle == "" {
+		c.DashboardSubtitle = "discovery dashboard"
+	}
+	if c.Alerts.Mode == "" {
+		c.Alerts.Mode = "integrated"
+	}
+	if c.Alerts.EvaluationInterval == 0 {
+		c.Alerts.EvaluationInterval = 30 * time.Second
+	}
+	if c.Alerts.DefaultCooldown == 0 {
+		c.Alerts.DefaultCooldown = 5 * time.Minute
 	}
 }

@@ -46,6 +46,15 @@ func (r *Registry) MountUI(mux *http.ServeMux) {
 	}))
 	mux.Handle("/metrics/history", wrap(r.metricsHistoryHandler()))
 	mux.Handle("/favicon.ico", wrap(r.faviconHandler))
+
+	// Alert subsystem routes.
+	if r.alerter != nil {
+		mux.Handle("/metrics/alerts", wrap(r.alertsPageHandler()))
+		mux.Handle("/metrics/alerts/rules", wrap(r.alertRulesHandler()))
+		mux.Handle("/metrics/alerts/rules/", wrap(r.alertRuleDeleteHandler()))
+		mux.Handle("/metrics/alerts/log", wrap(r.alertLogHandler()))
+		mux.Handle("/metrics/alerts/templates", wrap(r.alertTemplatesHandler()))
+	}
 }
 
 // DashboardHandler is the raw, unprotected handler that renders the main
@@ -117,6 +126,51 @@ func (r *Registry) HistoryHTTPHandler() http.Handler {
 	return r.metricsHistoryHandler()
 }
 
+// AlertsPageHTTPHandler returns the alerts dashboard page handler.
+// Returns nil if alerts are disabled.
+func (r *Registry) AlertsPageHTTPHandler() http.Handler {
+	if r.alerter == nil {
+		return nil
+	}
+	return r.alertsPageHandler()
+}
+
+// AlertRulesHTTPHandler returns the alert rules CRUD handler (GET list, POST create/update).
+// Returns nil if alerts are disabled.
+func (r *Registry) AlertRulesHTTPHandler() http.Handler {
+	if r.alerter == nil {
+		return nil
+	}
+	return r.alertRulesHandler()
+}
+
+// AlertRulesDeleteHTTPHandler returns the alert rule delete handler (DELETE /rules/{id}).
+// Returns nil if alerts are disabled.
+func (r *Registry) AlertRulesDeleteHTTPHandler() http.Handler {
+	if r.alerter == nil {
+		return nil
+	}
+	return r.alertRuleDeleteHandler()
+}
+
+// AlertLogHTTPHandler returns the alert log handler (GET).
+// Returns nil if alerts are disabled.
+func (r *Registry) AlertLogHTTPHandler() http.Handler {
+	if r.alerter == nil {
+		return nil
+	}
+	return r.alertLogHandler()
+}
+
+// AlertTemplatesHTTPHandler returns the predefined email templates handler.
+// Returns nil if alerts are disabled.
+func (r *Registry) AlertTemplatesHTTPHandler() http.Handler {
+	if r.alerter == nil {
+		return nil
+	}
+	return r.alertTemplatesHandler()
+}
+
 // metricsPageHandler renders the full dashboard shell. The card grid is
 // refreshed by HTMX polling /metrics/data.
 func (r *Registry) metricsPageHandler() http.Handler {
@@ -132,8 +186,11 @@ func (r *Registry) metricsPageHandler() http.Handler {
 			"HookCards":      buildHookCards(r.Snapshots()),
 			"Interval":       r.cfg.UI.PollInterval.String(),
 			"RuntimeEnabled": r.cfg.RuntimeMetrics.Enabled,
-			"ProjectName":    r.cfg.ProjectName,
-			"MaxLabelSeries": r.cfg.MaxLabelSeriesPerMetric,
+			"ProjectName":       r.cfg.ProjectName,
+			"DashboardSubtitle": r.cfg.DashboardSubtitle,
+			"MaxLabelSeries":    r.cfg.MaxLabelSeriesPerMetric,
+			"AlertsEnabled":     r.alerter != nil,
+			"HasNotifier":       r.alerter != nil && r.alerter.HasNotifier(),
 		}
 		// Render to a buffer first so a template error never produces a
 		// half-written response (which would force a superfluous WriteHeader).
@@ -232,6 +289,93 @@ func writeJSON(w http.ResponseWriter, v interface{}) {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(v)
+}
+
+// --- alert handlers -------------------------------------------------------
+
+// alertsPageHandler renders the alerts dashboard page.
+func (r *Registry) alertsPageHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		hasNotifier := r.alerter != nil && r.alerter.HasNotifier()
+		data := map[string]interface{}{
+			"ProjectName":  r.cfg.ProjectName,
+			"HasNotifier":  hasNotifier,
+		}
+		var buf bytes.Buffer
+		if err := alertsPageTpl.Execute(&buf, data); err != nil {
+			http.Error(w, "alerts page render error", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(buf.Bytes())
+	}
+}
+
+// alertRulesHandler handles GET (list all rules) and POST (create/update a rule).
+func (r *Registry) alertRulesHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		switch req.Method {
+		case http.MethodGet:
+			writeJSON(w, r.alerter.ListRules())
+
+		case http.MethodPost:
+			var rule AlertRule
+			if err := json.NewDecoder(req.Body).Decode(&rule); err != nil {
+				http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+				return
+			}
+			if rule.Name == "" || rule.Metric == "" {
+				http.Error(w, `{"error":"name and metric are required"}`, http.StatusBadRequest)
+				return
+			}
+			saved, err := r.alerter.AddRule(rule)
+			if err != nil {
+				http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(saved)
+
+		default:
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		}
+	}
+}
+
+// alertRuleDeleteHandler handles DELETE /metrics/alerts/rules/{id}.
+func (r *Registry) alertRuleDeleteHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodDelete {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		// Extract ID from path: /metrics/alerts/rules/{id}
+		id := strings.TrimPrefix(req.URL.Path, "/metrics/alerts/rules/")
+		if id == "" || id == req.URL.Path {
+			http.Error(w, `{"error":"missing rule id"}`, http.StatusBadRequest)
+			return
+		}
+		if err := r.alerter.RemoveRule(id); err != nil {
+			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// alertLogHandler returns the alert firing log as JSON.
+func (r *Registry) alertLogHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		writeJSON(w, r.AlertLog(200))
+	}
+}
+
+// alertTemplatesHandler returns the predefined email templates as JSON.
+func (r *Registry) alertTemplatesHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		writeJSON(w, r.AlertTemplates())
+	}
 }
 
 // --- card rendering model --------------------------------------------------
@@ -726,13 +870,19 @@ const dashboardSrc = `<!DOCTYPE html>
     <div class="flex items-center gap-2 mr-auto">
       <span class="inline-block w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
       <h1 class="text-lg font-semibold tracking-tight">{{.ProjectName}}</h1>
-      <span class="text-xs text-slate-500 font-mono">discovery dashboard</span>
+      <span class="text-xs text-slate-500 font-mono">{{.DashboardSubtitle}}</span>
     </div>
     <input id="search" type="text" placeholder="Search metrics..."
            class="text-sm font-mono px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-slate-600 w-56"
            oninput="applyFilter()">
     <button onclick="document.body.dataset.add='1'"
             class="text-sm px-3 py-1.5 rounded-lg border border-slate-800 bg-slate-900 hover:bg-slate-800 transition">+ Add Chart</button>
+    {{if .AlertsEnabled}}
+    <a href="/metrics/alerts"
+       class="text-sm px-3 py-1.5 rounded-lg border border-slate-800 bg-slate-900 hover:bg-slate-800 transition">Alerts</a>
+    <button onclick="document.body.dataset.alertAdd='1'"
+            class="text-sm px-3 py-1.5 rounded-lg border border-slate-800 bg-slate-900 hover:bg-slate-800 transition">+ Add Alert</button>
+    {{end}}
     <label class="text-xs text-slate-500 font-mono flex items-center gap-1.5 cursor-pointer select-none">
       <input type="checkbox" class="accent-slate-500"
              onchange="document.body.dataset.paused=this.checked?'1':''"> pause
@@ -1043,7 +1193,7 @@ const dashboardSrc = `<!DOCTYPE html>
       <svg class="w-3 h-3 text-slate-500 transition-transform" :class="open ? 'rotate-90' : ''" viewBox="0 0 20 20" fill="currentColor">
         <path fill-rule="evenodd" d="M7.21 14.77a.75.75 0 01.02-1.06L11.168 10 7.23 6.29a.75.75 0 111.04-1.08l4.5 4.25a.75.75 0 010 1.08l-4.5 4.25a.75.75 0 01-1.06-.02z" clip-rule="evenodd"/>
       </svg>
-      <h2 class="text-xs font-mono uppercase tracking-wider text-slate-500 group-hover:text-slate-400 transition">GoLens Internals</h2>
+      <h2 class="text-xs font-mono uppercase tracking-wider text-slate-500 group-hover:text-slate-400 transition">{{.ProjectName}} Internals</h2>
       <span class="text-[10px] font-mono text-slate-600">· cardinality & system</span>
     </button>
     <div x-show="open" x-transition.duration.200ms>
@@ -1140,6 +1290,144 @@ const dashboardSrc = `<!DOCTYPE html>
   </div>
 </div>
 
+<!-- Add-alert modal (Alpine): step 1 = pick metric, step 2 = configure rule -->
+{{if .AlertsEnabled}}
+<div x-data="{
+        get filteredMetrics(){
+          var q = (this.$store.ui.alertSearch||'').toLowerCase();
+          return (this.$store.ui.alertMetrics||[]).filter(function(m){
+            return m.name.toLowerCase().indexOf(q) >= 0;
+          });
+        }
+     }"
+     x-show="$store.ui.alertModal" x-cloak
+     class="fixed inset-0 z-30 flex items-center justify-center bg-black/60"
+     @keydown.escape.window="$store.ui.closeAlert()">
+  <div class="bg-slate-900 border border-slate-800 rounded-xl p-6 w-full max-w-lg shadow-xl"
+       @click.outside="$store.ui.closeAlert()">
+
+    <!-- Step 1: Pick metric -->
+    <template x-if="$store.ui.alertStep === 1">
+      <div>
+        <h3 class="text-sm font-semibold mb-3">New Alert — select a metric</h3>
+        <input type="text" placeholder="search metrics..." x-model="$store.ui.alertSearch" autofocus
+               class="w-full text-sm font-mono px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-slate-600">
+        <div class="mt-2 max-h-64 overflow-y-auto rounded-lg border border-slate-800 bg-slate-950">
+          <template x-for="m in filteredMetrics" :key="m.name">
+            <button type="button" @click="$store.ui.selectMetric(m.name)"
+                    class="block w-full text-left text-sm font-mono px-3 py-2 hover:bg-slate-800 transition flex items-center justify-between">
+              <span class="text-slate-300" x-text="m.name"></span>
+              <span class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800 text-slate-500" x-text="m.type"></span>
+            </button>
+          </template>
+          <div x-show="filteredMetrics.length === 0" class="px-3 py-4 text-center text-xs text-slate-600 font-mono">no matching metrics</div>
+        </div>
+        <div class="flex justify-end gap-2 mt-4">
+          <button @click="$store.ui.closeAlert()" class="text-sm px-3 py-1.5 rounded-lg border border-slate-800 hover:bg-slate-800">Cancel</button>
+        </div>
+      </div>
+    </template>
+
+    <!-- Step 2: Configure rule -->
+    <template x-if="$store.ui.alertStep === 2">
+      <div>
+        <div class="flex items-center gap-2 mb-4">
+          <button @click="$store.ui.alertStep=1" class="text-xs text-slate-500 hover:text-slate-300 transition">&larr; Back</button>
+          <h3 class="text-sm font-semibold">Configure Alert</h3>
+          <span class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800 text-slate-500" x-text="$store.ui.alertMetric"></span>
+        </div>
+        <form @submit.prevent="$store.ui.submitAlert()">
+          <div class="mb-3">
+            <label class="block text-xs text-slate-500 font-mono mb-1">Name</label>
+            <input type="text" x-model="$store.ui.alertForm.name" required placeholder="e.g. High Error Rate"
+                   class="w-full text-sm font-mono px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-slate-600">
+          </div>
+          <div class="flex gap-3 mb-3">
+            <div class="flex-1">
+              <label class="block text-xs text-slate-500 font-mono mb-1">Condition</label>
+              <select x-model="$store.ui.alertForm.condition"
+                      class="w-full text-sm font-mono px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 focus:outline-none focus:border-slate-600">
+                <option value="gt">&gt; Greater than</option>
+                <option value="gte">&ge; Greater or equal</option>
+                <option value="lt">&lt; Less than</option>
+                <option value="lte">&le; Less or equal</option>
+                <option value="eq">= Equal</option>
+              </select>
+            </div>
+            <div class="w-32">
+              <label class="block text-xs text-slate-500 font-mono mb-1">Threshold</label>
+              <input type="number" step="any" x-model.number="$store.ui.alertForm.threshold" required placeholder="0"
+                     class="w-full text-sm font-mono px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-slate-600">
+            </div>
+          </div>
+          <div class="mb-3">
+            <label class="block text-xs text-slate-500 font-mono mb-1">Cooldown (e.g. 5m, 1h)</label>
+            <input type="text" x-model="$store.ui.alertForm.cooldown" placeholder="5m"
+                   class="w-full text-sm font-mono px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-slate-600">
+          </div>
+          {{if .HasNotifier}}
+          <div class="border-t border-slate-800 my-4"></div>
+          <p class="text-xs text-slate-500 font-mono mb-3">Email Notification (optional)</p>
+          <div class="mb-3">
+            <label class="block text-xs text-slate-500 font-mono mb-1">To (comma-separated)</label>
+            <input type="text" x-model="$store.ui.alertForm.email_to" placeholder="team@example.com"
+                   class="w-full text-sm font-mono px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-slate-600">
+          </div>
+          <div class="mb-3" x-show="$store.ui.alertTemplates.length > 0">
+            <label class="block text-xs text-slate-500 font-mono mb-1">Format</label>
+            <select x-model="$store.ui.alertForm.email_html"
+                    class="w-full text-sm font-mono px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 focus:outline-none focus:border-slate-600">
+              <option value="false">Text</option>
+              <option value="true">HTML</option>
+            </select>
+          </div>
+          <div class="mb-3" x-show="$store.ui.alertForm.email_html === 'true' && $store.ui.alertTemplates.length > 0">
+            <label class="block text-xs text-slate-500 font-mono mb-1">Template</label>
+            <select @change="$store.ui.applyTemplate($event.target.value)"
+                    class="w-full text-sm font-mono px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 focus:outline-none focus:border-slate-600">
+              <option value="">Custom (edit below)</option>
+              <template x-for="t in $store.ui.alertTemplates" :key="t.id">
+                <option :value="t.id" x-text="t.name"></option>
+              </template>
+            </select>
+          </div>
+          <div class="mb-3">
+            <label class="block text-xs text-slate-500 font-mono mb-1">Subject</label>
+            <input type="text" x-model="$store.ui.alertForm.email_subject" placeholder="Alert: {{"{{.RuleName}}"}}"
+                   class="w-full text-sm font-mono px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-slate-600">
+          </div>
+          <div class="mb-4">
+            <label class="block text-xs text-slate-500 font-mono mb-1">Body</label>
+            <textarea x-model="$store.ui.alertForm.email_body" rows="4" placeholder="Custom alert message..."
+                      class="w-full text-sm font-mono px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-slate-600 resize-none"></textarea>
+          </div>
+          <details class="mb-4" x-show="$store.ui.alertForm.email_html === 'true'">
+            <summary class="text-xs text-slate-500 font-mono cursor-pointer hover:text-slate-400 transition">Available template variables</summary>
+            <div class="mt-2 bg-slate-950 border border-slate-800 rounded-lg p-3 text-[11px] font-mono text-slate-400 space-y-0.5">
+              <div><span class="text-emerald-400">{{"{{.RuleName}}"}}</span> — rule name</div>
+              <div><span class="text-emerald-400">{{"{{.Metric}}"}}</span> — metric name</div>
+              <div><span class="text-emerald-400">{{"{{.Value}}"}}</span> — current value</div>
+              <div><span class="text-emerald-400">{{"{{.Threshold}}"}}</span> — threshold</div>
+              <div><span class="text-emerald-400">{{"{{.ConditionLabel}}"}}</span> — condition (&gt;, &lt;, &gt;=, &lt;=, ==)</div>
+              <div><span class="text-emerald-400">{{"{{.FiredAt}}"}}</span> — timestamp</div>
+              <div><span class="text-emerald-400">{{"{{.ProjectName}}"}}</span> — project name</div>
+            </div>
+          </details>
+          {{end}}
+          <div class="flex justify-end gap-2">
+            <button type="button" @click="$store.ui.closeAlert()"
+                    class="text-sm px-3 py-1.5 rounded-lg border border-slate-800 hover:bg-slate-800">Cancel</button>
+            <button type="submit"
+                    class="text-sm px-3 py-1.5 rounded-lg bg-emerald-500/90 hover:bg-emerald-500 text-slate-950 font-medium">Create Alert</button>
+          </div>
+        </form>
+      </div>
+    </template>
+
+  </div>
+</div>
+{{end}}
+
 <script>
   function applyTheme(t){
     var c = document.documentElement.classList;
@@ -1169,7 +1457,83 @@ const dashboardSrc = `<!DOCTYPE html>
       charts: loadCharts(),
       has(n){ return this.charts.indexOf(n) >= 0; },
       add(n){ if (n && !this.has(n)) { this.charts.push(n); saveCharts(this.charts); } },
-      remove(n){ this.charts = this.charts.filter(x => x !== n); saveCharts(this.charts); }
+      remove(n){ this.charts = this.charts.filter(x => x !== n); saveCharts(this.charts); },
+
+      // Alert modal state
+      alertModal: false,
+      alertStep: 1,
+      alertMetric: '',
+      alertSearch: '',
+      alertMetrics: [],
+      alertTemplates: [],
+      alertForm: { name:'', condition:'gt', threshold:0, cooldown:'5m', email_to:'', email_subject:'', email_body:'', email_html:'false' },
+
+      openAlert(){
+        this.alertStep = 1;
+        this.alertMetric = '';
+        this.alertSearch = '';
+        this.alertForm = { name:'', condition:'gt', threshold:0, cooldown:'5m', email_to:'', email_subject:'', email_body:'', email_html:'false' };
+        var self = this;
+        fetch('/metrics/data', {headers:{'Accept':'application/json'}})
+          .then(function(r){ return r.json(); })
+          .then(function(d){ self.alertMetrics = (d||[]).map(function(s){ return {name:s.Name, type:s.Type}; }); })
+          .catch(function(){});
+        fetch('/metrics/alerts/templates', {headers:{'Accept':'application/json'}})
+          .then(function(r){ return r.json(); })
+          .then(function(d){ self.alertTemplates = d || []; })
+          .catch(function(){ self.alertTemplates = []; });
+        this.alertModal = true;
+      },
+
+      applyTemplate(id){
+        if (!id) return;
+        var t = this.alertTemplates.find(function(x){ return x.id === id; });
+        if (t) {
+          this.alertForm.email_subject = t.subject;
+          this.alertForm.email_body = t.body;
+        }
+      },
+
+      selectMetric(name){
+        this.alertMetric = name;
+        this.alertForm.name = name + ' alert';
+        this.alertStep = 2;
+      },
+
+      closeAlert(){
+        this.alertModal = false;
+        this.alertStep = 1;
+      },
+
+      submitAlert(){
+        var body = {
+          name: this.alertForm.name,
+          metric: this.alertMetric,
+          condition: this.alertForm.condition,
+          threshold: this.alertForm.threshold,
+          cooldown: this.alertForm.cooldown,
+          enabled: true
+        };
+        var hasNotifier = {{if .HasNotifier}}true{{else}}false{{end}};
+        if (hasNotifier) {
+          body.email_to = this.alertForm.email_to ? this.alertForm.email_to.split(',').map(function(s){ return s.trim(); }).filter(Boolean) : [];
+          body.email_subject = this.alertForm.email_subject;
+          body.email_body = this.alertForm.email_body;
+          body.email_html = this.alertForm.email_html === 'true';
+        }
+        var self = this;
+        fetch('/metrics/alerts/rules', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify(body)
+        }).then(function(r){
+          if (!r.ok) return r.json().then(function(e){ throw new Error(e.error || 'Server error'); });
+          return r.json();
+        }).then(function(){
+          self.closeAlert();
+          showToast('Alert created for ' + self.alertMetric, 'success');
+        }).catch(function(e){ showToast(e.message || 'Failed to create alert'); });
+      }
     });
   });
   // open modal from the header button — always start from a clean state
@@ -1182,6 +1546,15 @@ const dashboardSrc = `<!DOCTYPE html>
     }
   });
   mo.observe(document.body, { attributes: true, attributeFilter: ['data-add'] });
+
+  // open alert modal from the header button
+  const moAlert = new MutationObserver(() => {
+    if (document.body.dataset.alertAdd === '1') {
+      Alpine.store('ui').openAlert();
+      delete document.body.dataset.alertAdd;
+    }
+  });
+  moAlert.observe(document.body, { attributes: true, attributeFilter: ['data-alert-add'] });
 
   // Add the searched/selected metric as a pinned chart (no navigation).
   function addChart(){
@@ -1413,7 +1786,8 @@ const dashboardSrc = `<!DOCTYPE html>
   document.addEventListener('DOMContentLoaded', () => { sortCharts(); applyFilter(); initMetricsDnD(); });
 
   // Cooldown ring: depletes over the poll interval, shows remaining seconds,
-  // resets on each HTMX refresh, and freezes while paused.
+  // resets on each HTMX refresh, and freezes while paused. Turns red when the
+  // previous refresh failed, green when successful.
   (function(){
     const pollMs = {{.PollMs}};
     const ring = document.getElementById('cooldown-ring');
@@ -1438,7 +1812,11 @@ const dashboardSrc = `<!DOCTYPE html>
       requestAnimationFrame(frame);
     }
     requestAnimationFrame(frame);
-    document.body.addEventListener('htmx:afterRequest', () => { start = performance.now(); });
+    document.body.addEventListener('htmx:afterRequest', (evt) => {
+      start = performance.now();
+      const ok = evt.detail.successful;
+      ring.setAttribute('stroke', ok ? '#34d399' : '#ef4444');
+    });
   })();
 
   // --- Runtime Health: time-series charts ---
@@ -1894,7 +2272,25 @@ const dashboardSrc = `<!DOCTYPE html>
       }
     };
   }
+
+  // Dashboard toast notification
+  var _toastTimer = null;
+  function showToast(msg, type){
+    var el = document.getElementById('dash-toast');
+    if (!el) return;
+    el.textContent = msg;
+    el.className = 'fixed bottom-6 right-6 z-40 max-w-sm px-4 py-2.5 rounded-lg text-sm font-mono shadow-lg border ' +
+      (type === 'success' ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-rose-500/10 border-rose-500/30 text-rose-400');
+    el.style.display = 'block';
+    if (_toastTimer) clearTimeout(_toastTimer);
+    _toastTimer = setTimeout(function(){ el.style.display = 'none'; }, 4000);
+  }
 </script>
+
+<!-- Toast -->
+<div id="dash-toast" style="display:none"
+     class="fixed bottom-6 right-6 z-40 max-w-sm px-4 py-2.5 rounded-lg text-sm font-mono shadow-lg border"></div>
+
 </body>
 </html>`
 
